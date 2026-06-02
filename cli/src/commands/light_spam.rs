@@ -32,6 +32,7 @@ use libp2p::{
     Multiaddr, PeerId, Swarm,
 };
 use rand::RngCore;
+use sha3::{Digest, Keccak256};
 use std::collections::HashMap;
 use std::error::Error;
 use std::time::{Duration, Instant};
@@ -103,6 +104,53 @@ impl Chain {
 /// `revive_get_storage`; the 32-byte key is randomised per request (cache-bust).
 const REVIVE_DEFAULT_ADDRESS: &str = "a1b2b939E82b2ecE55Bd8a0E283818BfC1CA6CDc";
 
+/// Ethereum Keccak-256 (NOT SHA3-256).
+fn keccak256(data: &[u8]) -> [u8; 32] {
+    let mut hasher = Keccak256::new();
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
+/// EIP-137 namehash of a dotted domain, e.g. `playground.dot`.
+///
+/// `node("") = 0x00…00`; `node(label.parent) = keccak256(node(parent) ++ keccak256(label))`,
+/// processing labels right-to-left (TLD first).
+fn namehash(domain: &str) -> [u8; 32] {
+    let mut node = [0u8; 32];
+    let labels: Vec<&str> = domain.split('.').filter(|l| !l.is_empty()).collect();
+    for label in labels.into_iter().rev() {
+        let label_hash = keccak256(label.as_bytes());
+        let mut buf = [0u8; 64];
+        buf[..32].copy_from_slice(&node);
+        buf[32..].copy_from_slice(&label_hash);
+        node = keccak256(&buf);
+    }
+    node
+}
+
+/// Solidity storage slot for `mapping(bytes32 => …)` at declaration `slot`:
+/// `keccak256(key ++ uint256(slot))` (`abi.ts:60`).
+fn mapping_slot_key(key: &[u8; 32], slot: u64) -> [u8; 32] {
+    let mut buf = [0u8; 64];
+    buf[..32].copy_from_slice(key);
+    // uint256 big-endian: the slot number lives in the low 8 bytes.
+    buf[56..64].copy_from_slice(&slot.to_be_bytes());
+    keccak256(&buf)
+}
+
+/// A precomputed dotNS read: the full derivation `domain → namehash → slotKey`,
+/// and the assembled `get_storage` argument (`address ++ slotKey`).
+#[derive(Debug, Clone)]
+struct DotnsEntry {
+    domain: String,
+    namehash: [u8; 32],
+    slot: u64,
+    slot_key: [u8; 32],
+    address: [u8; 20],
+    /// `address (20) ++ slot_key (32)` — the `ReviveApi_get_storage` data argument.
+    data: Vec<u8>,
+}
+
 /// How a single request is built. Most are runtime-API calls (`RemoteCallRequest`);
 /// `read` is a storage Merkle proof (`RemoteReadRequest`).
 #[derive(Debug, Clone)]
@@ -119,6 +167,9 @@ enum MethodKind {
     /// `ReviveApi_get_storage(H160, [u8;32])` — Asset Hub. Fixed contract
     /// address, random 32-byte key.
     ReviveGetStorage { address: [u8; 20] },
+    /// `ReviveApi_get_storage` against `DOTNS_REGISTRY` reading the real
+    /// `REGISTRY_RECORDS` (owner) slot of one of the given dotNS domains.
+    ReviveDotns { entries: Vec<DotnsEntry> },
     /// Arbitrary `RemoteCallRequest` with a fixed method + hex-encoded data.
     GenericCall { method: String, data: Vec<u8> },
     /// Arbitrary `RemoteReadRequest` for one or more hex-encoded storage keys.
@@ -169,6 +220,14 @@ impl MethodKind {
                 data.extend_from_slice(&key);
                 light::remote_call(block, "ReviveApi_get_storage".to_string(), data)
             }
+            MethodKind::ReviveDotns { entries } => {
+                let i = rand::thread_rng().next_u32() as usize % entries.len();
+                light::remote_call(
+                    block,
+                    "ReviveApi_get_storage".to_string(),
+                    entries[i].data.clone(),
+                )
+            }
             MethodKind::GenericCall { method, data } => {
                 light::remote_call(block, method.clone(), data.clone())
             }
@@ -189,6 +248,36 @@ fn parse_method(token: &str) -> Result<(String, MethodKind), Box<dyn Error>> {
                 .try_into()
                 .map_err(|_| "revive default address is not 20 bytes")?;
             MethodKind::ReviveGetStorage { address }
+        }
+        // revive_dotns:<domain>[,<domain>…] — read the real REGISTRY_RECORDS
+        // (owner) slot for each domain off DOTNS_REGISTRY.
+        _ if token.starts_with("revive_dotns:") => {
+            let address: [u8; 20] = hex::decode(REVIVE_DEFAULT_ADDRESS)?
+                .try_into()
+                .map_err(|_| "revive default address is not 20 bytes")?;
+            // Domains are separated by '+' (not ',', which is the method-mix
+            // separator) so revive_dotns can be combined with other methods.
+            let rest = &token["revive_dotns:".len()..];
+            let mut entries = Vec::new();
+            for domain in rest.split('+').map(str::trim).filter(|s| !s.is_empty()) {
+                let namehash = namehash(domain);
+                let slot = 0u64; // REGISTRY_RECORDS: mapping(bytes32 => address) at slot 0
+                let slot_key = mapping_slot_key(&namehash, slot);
+                let mut data = address.to_vec();
+                data.extend_from_slice(&slot_key);
+                entries.push(DotnsEntry {
+                    domain: domain.to_string(),
+                    namehash,
+                    slot,
+                    slot_key,
+                    address,
+                    data,
+                });
+            }
+            if entries.is_empty() {
+                return Err("revive_dotns needs at least one domain".into());
+            }
+            MethodKind::ReviveDotns { entries }
         }
         // Core_version etc: a no-arg runtime call, handy for connectivity checks.
         _ if !token.contains(':') => MethodKind::GenericCall {
@@ -230,7 +319,10 @@ fn parse_method_spec(spec: &str) -> Result<(Vec<(String, MethodKind)>, Vec<usize
         // A weight suffix only applies to the named methods (no embedded ':').
         // Generic `call:`/`read:` tokens carry their own colons, so we only peel
         // a trailing ":<n>" when the whole token isn't a generic form.
-        let (name, weight) = if tok.starts_with("call:") || tok.starts_with("read:") {
+        let (name, weight) = if tok.starts_with("call:")
+            || tok.starts_with("read:")
+            || tok.starts_with("revive_dotns:")
+        {
             (tok, 1usize)
         } else if let Some((n, w)) = tok.rsplit_once(':') {
             match w.parse::<usize>() {
@@ -348,6 +440,21 @@ struct MethodStats {
     last_err: Option<String>,
 }
 
+/// Classify an [`OutboundFailure`] into a stable, human-readable bucket key.
+///
+/// The `Io` case keeps the inner message (e.g. "max sub-streams reached", which
+/// is a *client-side* request-response cap, not a server signal) so the error
+/// summary distinguishes tool artifacts from real node behaviour.
+fn classify_failure(error: &OutboundFailure) -> String {
+    match error {
+        OutboundFailure::DialFailure => "dial-failure".to_string(),
+        OutboundFailure::Timeout => "timeout (no response within --request-timeout)".to_string(),
+        OutboundFailure::ConnectionClosed => "connection-closed".to_string(),
+        OutboundFailure::UnsupportedProtocols => "unsupported-protocols".to_string(),
+        OutboundFailure::Io(err) => format!("io: {err}"),
+    }
+}
+
 /// `p`-th percentile (0..=100) of the latencies, in milliseconds.
 fn percentile_ms(sorted_us: &[u64], p: usize) -> f64 {
     if sorted_us.is_empty() {
@@ -368,6 +475,8 @@ struct LightSpammer {
     methods: Vec<(String, MethodKind)>,
     schedule: Vec<usize>,
     stats: Vec<MethodStats>,
+    /// Aggregate failure breakdown: human-readable reason -> count.
+    errors: HashMap<String, u64>,
     pending: HashMap<OutboundRequestId, (usize, Instant)>,
     issued: usize,
     in_flight: usize,
@@ -419,7 +528,13 @@ impl LightSpammer {
                 }
             }
             // Substream closed without a response (node couldn't/declined).
-            Err(()) => st.err += 1,
+            Err(()) => {
+                st.err += 1;
+                *self
+                    .errors
+                    .entry("no-response: peer closed substream (no proof)".to_string())
+                    .or_insert(0) += 1;
+            }
         }
     }
 
@@ -432,7 +547,9 @@ impl LightSpammer {
         } else {
             st.err += 1;
         }
-        st.last_err = Some(format!("{error:?}"));
+        let reason = classify_failure(&error);
+        st.last_err = Some(reason.clone());
+        *self.errors.entry(reason).or_insert(0) += 1;
     }
 
     fn handle_event(&mut self, event: SwarmEvent<SpamBehaviourEvent>) {
@@ -564,6 +681,14 @@ impl LightSpammer {
             percentile_ms(&all, 99),
             proof
         );
+        if !self.errors.is_empty() {
+            let mut rows: Vec<(&String, &u64)> = self.errors.iter().collect();
+            rows.sort_by(|a, b| b.1.cmp(a.1));
+            println!("errors (reason -> count):");
+            for (reason, count) in rows {
+                println!("  {count:>6}  {reason}");
+            }
+        }
         println!("per method:");
         for (i, (label, _)) in self.methods.iter().enumerate() {
             let s = &self.stats[i];
@@ -598,9 +723,10 @@ impl LightSpammer {
 async fn build_swarm(
     light_protocol: &str,
     request_timeout: Duration,
+    max_concurrent_streams: usize,
 ) -> Result<Swarm<SpamBehaviour>, Box<dyn Error>> {
     let local_key = identity::Keypair::generate_ed25519();
-    let light = light::behaviour(light_protocol, request_timeout)?;
+    let light = light::behaviour(light_protocol, request_timeout, max_concurrent_streams)?;
 
     let tcp_config = libp2p::tcp::Config::new().nodelay(true);
     let swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
@@ -682,6 +808,34 @@ pub async fn spam_light(
     );
     println!("Count:       {count} (concurrency {concurrency}, req timeout {request_timeout:?})");
 
+    // Show how each revive_dotns argument is assembled from the domain.
+    for (label, kind) in &methods {
+        if let MethodKind::ReviveDotns { entries } = kind {
+            println!("{label} — ReviveApi_get_storage argument derivation:");
+            for e in entries {
+                println!("  domain   = {}", e.domain);
+                println!("    namehash = 0x{}  (EIP-137)", hex::encode(e.namehash));
+                println!(
+                    "    slot     = {}  (REGISTRY_RECORDS: mapping(bytes32 => address))",
+                    e.slot
+                );
+                println!(
+                    "    slotKey  = keccak256(namehash ++ uint256(slot)) = 0x{}",
+                    hex::encode(e.slot_key)
+                );
+                println!(
+                    "    address  = 0x{}  (DOTNS_REGISTRY)",
+                    hex::encode(e.address)
+                );
+                println!(
+                    "    data     = address ++ slotKey = 0x{}  ({} bytes)",
+                    hex::encode(&e.data),
+                    e.data.len()
+                );
+            }
+        }
+    }
+
     println!("Resolving execution block...");
     let head = head_source(rpc_url, block).await?;
     {
@@ -689,12 +843,17 @@ pub async fn spam_light(
         println!("Block:       #{num} 0x{}", hex::encode(&hash));
     }
 
-    let swarm = build_swarm(&light_protocol, request_timeout).await?;
+    // Raise the request-response per-connection stream cap above the spam
+    // window so the client never self-throttles with "max sub-streams reached"
+    // (libp2p's default is 100); the server stays the only limiter.
+    let max_streams = concurrency.saturating_mul(2).max(256);
+    let swarm = build_swarm(&light_protocol, request_timeout, max_streams).await?;
     let mut spammer = LightSpammer {
         swarm,
         peer: None,
         head,
         stats: (0..methods.len()).map(|_| MethodStats::default()).collect(),
+        errors: HashMap::new(),
         methods,
         schedule,
         pending: HashMap::new(),

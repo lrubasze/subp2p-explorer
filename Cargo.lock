@@ -4503,6 +4503,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha3",
  "ss58-registry",
  "subp2p-explorer",
  "thiserror 1.0.69",

@@ -171,13 +171,21 @@ pub fn protocol_name(genesis: &str) -> String {
 
 /// Construct an outbound-only light request-response behaviour for the given
 /// protocol name (e.g. `/<genesis>/light/2`).
+///
+/// `max_concurrent_streams` is the per-connection cap on in-flight outbound
+/// requests. The libp2p default is only 100; set it from the desired spam
+/// concurrency so the behaviour doesn't throttle itself with
+/// `"max sub-streams reached"` (which would masquerade as server load-shedding).
 pub fn behaviour(
     protocol: &str,
     request_timeout: Duration,
+    max_concurrent_streams: usize,
 ) -> Result<request_response::Behaviour<LightCodec>, std::io::Error> {
     let protocol = StreamProtocol::try_from_owned(protocol.to_string())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let cfg = request_response::Config::default().with_request_timeout(request_timeout);
+    let cfg = request_response::Config::default()
+        .with_request_timeout(request_timeout)
+        .with_max_concurrent_streams(max_concurrent_streams);
     Ok(request_response::Behaviour::with_codec(
         LightCodec::default(),
         std::iter::once((protocol, ProtocolSupport::Outbound)),

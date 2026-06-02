@@ -72,6 +72,7 @@ caches don't absorb the load.
 | `account_authorization` | Bulletin | `BulletinTransactionStorageApi_account_authorization` | `AccountId32` (32 B) |
 | `indexed_transactions` | Bulletin | `TransactionStorageApi_indexed_transactions` | `u32` head number (4 B) |
 | `revive_get_storage` | Asset Hub | `ReviveApi_get_storage` | `H160` (20 B) ++ random key (32 B) = 52 B |
+| `revive_dotns:<dom>[+<dom>…]` | Asset Hub | `ReviveApi_get_storage` | reads the **real** `DOTNS_REGISTRY` owner slot of each domain: `H160` ++ `keccak256(namehash(domain) ++ uint256(0))`; derivation logged at startup. Domains separated by `+` (not `,`) |
 | `call:<method>:<hexdata>` | any | `<method>` | raw hex `data` |
 | `read:<hexkey>[,<hexkey>…]` | any | (`RemoteReadRequest`) | storage Merkle proof for the keys |
 | `<BareName>` | any | `<BareName>` | no args (e.g. `Core_version`, `Metadata_metadata`) |
@@ -79,6 +80,22 @@ caches don't absorb the load.
 > `revive` lives on **Asset Hub**, not Bulletin. `revive_get_storage` defaults to a
 > dotNS contract address and a random 32-byte slot key (a proof of absence in the
 > contract's child trie is still real execution).
+
+### Mixing methods
+
+`--method` takes a **comma-separated** list; each request round-robins over the
+weight-expanded list (port of `call-load.js`):
+
+- `"account_nonce,can_store"` — even 1:1 split.
+- `"can_store:3,account_nonce,indexed_transactions"` — weighted 3:1:1.
+- `"revive_get_storage,account_nonce"` — the Asset Hub preset default.
+
+Caveat: `revive_dotns` separates its **domains** with `+`, because `,` already
+separates methods — so
+`"revive_dotns:playground.dot+hello.dot,account_nonce"` is two methods
+(a dotNS reader over two domains, plus `account_nonce`). Weights aren't applied to
+`revive_dotns` / `call:` / `read:` tokens (they carry their own punctuation);
+repeat the token to weight it.
 
 ---
 
@@ -121,6 +138,32 @@ cargo run -p subp2p-explorer-cli -- spam-light \
 cargo run -p subp2p-explorer-cli -- spam-light \
   --chain paseo-next-asset-hub \
   --method "call:ReviveApi_get_storage:a1b2b939e82b2ece55bd8a0e283818bfc1ca6cdc46ac7f91e4a3efd0d43518a33a18c9095a670570fe1c157617e2733d52cb0980"
+
+# Read REAL dotNS owner records by domain — the tool derives each slotKey from
+# namehash(domain) and logs the full derivation at startup. Domains are joined
+# with '+' (NOT ',', which separates methods):
+cargo run -p subp2p-explorer-cli -- spam-light \
+  --chain paseo-next-asset-hub \
+  --method "revive_dotns:playground.dot+hello.dot+host-playground.dot" \
+  --count 50 --concurrency 8
+
+# Mix revive_dotns with another method (comma separates methods, '+' separates domains):
+cargo run -p subp2p-explorer-cli -- spam-light \
+  --chain paseo-next-asset-hub \
+  --method "revive_dotns:playground.dot+hello.dot+host-playground.dot,account_nonce" \
+  --count 16 --concurrency 4
+```
+
+Startup prints the derivation for each domain, e.g.:
+
+```
+revive_dotns:… — ReviveApi_get_storage argument derivation:
+  domain   = playground.dot
+    namehash = 0x8d10a9ec…224b789  (EIP-137)
+    slot     = 0  (REGISTRY_RECORDS: mapping(bytes32 => address))
+    slotKey  = keccak256(namehash ++ uint256(slot)) = 0x46ac7f91…52cb0980
+    address  = 0xa1b2b939…c1ca6cdc  (DOTNS_REGISTRY)
+    data     = address ++ slotKey = 0xa1b2…0980  (52 bytes)
 ```
 
 ---
@@ -204,6 +247,14 @@ cargo run -p subp2p-explorer-cli -- spam-light \
 cargo run -p subp2p-explorer-cli -- spam-light \
   --chain paseo-next-asset-hub \
   --address /dns4/paseo-asset-hub-next-collator-node-1.parity-testnet.parity.io/tcp/443/wss \
+  --count 1000 --concurrency 32
+
+# Asset Hub Next — fully explicit (no preset): collator node 0, real dotNS reads.
+# RPC fetches genesis + tracks the head; the collator is the spam target.
+cargo run -p subp2p-explorer-cli -- spam-light \
+  --url wss://paseo-asset-hub-next-rpc.polkadot.io \
+  --address /dns4/paseo-asset-hub-next-collator-node-0.parity-testnet.parity.io/tcp/443/wss \
+  --method "revive_dotns:playground.dot+hello.dot+host-playground.dot,account_nonce" \
   --count 1000 --concurrency 32
 ```
 
