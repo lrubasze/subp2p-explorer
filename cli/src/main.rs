@@ -14,6 +14,7 @@ use commands::{
     discover_peer::discover_peer,
     discovery::discover_network,
     extrinsics::submit_extrinsics,
+    light_spam::{spam_light, Chain},
 };
 use jsonrpsee::client_transport::ws::Url;
 use std::{error::Error, io::Read, path::PathBuf};
@@ -28,6 +29,62 @@ enum Command {
     DiscoverNetwork(DiscoverNetworkOpts),
     DiscoverPeer(DiscoverPeerOpts),
     VerifyBootnodes(BootnodesOpts),
+    SpamLight(SpamLightOpts),
+}
+
+/// Spam the `/<genesis>/light/2` request-response protocol of an appointed full
+/// node to load-test its light-client request handler.
+///
+/// Dials the host directly (no discovery, no smoldot sync), learns its peer id
+/// during the handshake, and issues `RemoteCallRequest`s with a bounded
+/// in-flight window. The execution block is kept fresh via an RPC subscription
+/// to the finalized head.
+#[derive(Debug, ClapParser)]
+pub struct SpamLightOpts {
+    /// Chain preset: fills in the RPC url, a default p2p host, and a default
+    /// method mix. Any of those can still be overridden by the flags below.
+    #[clap(long, short, value_enum)]
+    chain: Option<Chain>,
+    /// The URL of the chain RPC endpoint (fetches genesis + tracks the head).
+    /// Required unless --chain is given.
+    #[clap(long, short)]
+    url: Option<String>,
+    /// Multiaddress of the full node to dial. The peer id is optional and is
+    /// learned during the noise handshake. Required unless --chain is given.
+    ///
+    /// For example, "/dns4/paseo-bulletin-next-rpc-node-0.polkadot.io/tcp/443/wss".
+    #[clap(long, short)]
+    address: Option<String>,
+    /// Hex-encoded genesis hash of the chain. Fetched from the RPC if omitted.
+    #[clap(long, short)]
+    genesis: Option<String>,
+    /// Pin a hex-encoded block hash to execute against (disables the head
+    /// subscription). Defaults to tracking the finalized head.
+    #[clap(long, short)]
+    block: Option<String>,
+    /// Override the full light protocol name (e.g. for chains with a fork id:
+    /// "/<genesis>/<fork_id>/light/2"). Defaults to "/<genesis>/light/2".
+    #[clap(long, short)]
+    protocol: Option<String>,
+    /// Method mix to spam, comma-separated with optional ":weight". Names:
+    /// account_nonce, can_store, account_authorization, indexed_transactions,
+    /// revive_get_storage; generic "call:<method>:<hexdata>" / "read:<hexkey>";
+    /// or a bare runtime-API name (no args, e.g. Core_version). Defaults to the
+    /// chain preset, else account_nonce.
+    #[clap(long, short)]
+    method: Option<String>,
+    /// Total number of requests to issue.
+    #[clap(long, default_value = "100")]
+    count: usize,
+    /// Maximum in-flight requests (the spam window).
+    #[clap(long, default_value = "8")]
+    concurrency: usize,
+    /// Per-request timeout in seconds (counted separately as the saturation signal).
+    #[clap(long, default_value = "10", value_parser = parse_duration)]
+    request_timeout: std::time::Duration,
+    /// Overall wall-clock timeout in seconds for the whole run.
+    #[clap(long, short, default_value = "120", value_parser = parse_duration)]
+    timeout: std::time::Duration,
 }
 
 /// Discover the authorities of the p2p network.
@@ -330,6 +387,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .await
         }
         Command::DialPeer(opts) => dial_peer(opts.address, opts.timeout).await,
+        Command::SpamLight(opts) => {
+            spam_light(
+                opts.chain,
+                opts.url,
+                opts.address,
+                opts.genesis,
+                opts.block,
+                opts.protocol,
+                opts.method,
+                opts.count,
+                opts.concurrency,
+                opts.request_timeout,
+                opts.timeout,
+            )
+            .await
+        }
         Command::VerifyBootnodes(opts) => opts.verify_bootnodes().await,
         Command::Authorities(opts) => {
             let rpc_url = Url::parse(&opts.url)?;

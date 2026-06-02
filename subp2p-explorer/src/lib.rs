@@ -5,6 +5,7 @@
 use libp2p::swarm::NetworkBehaviour;
 
 pub mod discovery;
+pub mod light;
 pub mod notifications;
 pub mod peer_behavior;
 pub mod transport;
