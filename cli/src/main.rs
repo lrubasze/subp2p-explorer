@@ -14,7 +14,9 @@ use commands::{
     discover_peer::discover_peer,
     discovery::discover_network,
     extrinsics::submit_extrinsics,
-    light_spam::{spam_light, Chain},
+    light_common::Chain,
+    light_spam::spam_light,
+    soak_light::soak_light,
 };
 use jsonrpsee::client_transport::ws::Url;
 use std::{error::Error, io::Read, path::PathBuf};
@@ -30,6 +32,7 @@ enum Command {
     DiscoverPeer(DiscoverPeerOpts),
     VerifyBootnodes(BootnodesOpts),
     SpamLight(SpamLightOpts),
+    SoakLight(SoakLightOpts),
 }
 
 /// Spam the `/<genesis>/light/2` request-response protocol of an appointed full
@@ -76,15 +79,71 @@ pub struct SpamLightOpts {
     /// Total number of requests to issue.
     #[clap(long, default_value = "100")]
     count: usize,
-    /// Maximum in-flight requests (the spam window).
+    /// Maximum in-flight requests per connection (the spam window).
     #[clap(long, default_value = "8")]
     concurrency: usize,
+    /// Number of independent connections, each with its own PeerId. Each runs the
+    /// full --count at --concurrency, so total load = connections × count.
+    #[clap(long, default_value = "1")]
+    connections: usize,
+    /// Delay in milliseconds between opening successive connections (smooths the
+    /// dial/TLS burst for large --connections). 0 = all at once.
+    #[clap(long, default_value = "0")]
+    stagger_ms: u64,
     /// Per-request timeout in seconds (counted separately as the saturation signal).
     #[clap(long, default_value = "10", value_parser = parse_duration)]
     request_timeout: std::time::Duration,
     /// Overall wall-clock timeout in seconds for the whole run.
     #[clap(long, short, default_value = "120", value_parser = parse_duration)]
     timeout: std::time::Duration,
+}
+
+/// Sustained-rate / long-duration soak test for `/<genesis>/light/2`.
+///
+/// Open-loop: offers `--rate` req/s for `--duration`, opening `--clients` total
+/// connections over the run (each a fresh identity, 1 request in flight, closed
+/// after its derived share of the load). Verifies a node stays healthy under
+/// sustained (possibly over-capacity) load with realistic client churn.
+#[derive(Debug, ClapParser)]
+pub struct SoakLightOpts {
+    /// Chain preset (RPC url, default p2p host, default method mix).
+    #[clap(long, short, value_enum)]
+    chain: Option<Chain>,
+    /// RPC endpoint (fetches genesis + tracks the head). Required unless --chain.
+    #[clap(long, short)]
+    url: Option<String>,
+    /// Multiaddress of the full node to dial. Required unless --chain.
+    #[clap(long, short)]
+    address: Option<String>,
+    /// Hex-encoded genesis hash. Fetched from the RPC if omitted.
+    #[clap(long, short)]
+    genesis: Option<String>,
+    /// Pin a hex-encoded execution block hash (disables head subscription).
+    #[clap(long, short)]
+    block: Option<String>,
+    /// Override the full light protocol name (e.g. fork-id chains).
+    #[clap(long, short)]
+    protocol: Option<String>,
+    /// Method mix (see `spam-light --help` for the syntax). Defaults to the chain
+    /// preset, else account_nonce.
+    #[clap(long, short)]
+    method: Option<String>,
+    /// Offered request rate (requests/second).
+    #[clap(long, short)]
+    rate: u64,
+    /// How long to run, in seconds.
+    #[clap(long, short, value_parser = parse_duration)]
+    duration: std::time::Duration,
+    /// Total number of connections opened over the run (cumulative, not
+    /// concurrent). Per-connection request budget = rate*duration/clients.
+    #[clap(long)]
+    clients: usize,
+    /// Safety cap on simultaneous connections (backstop only).
+    #[clap(long, default_value = "8192")]
+    max_concurrent: usize,
+    /// Per-request timeout in seconds.
+    #[clap(long, default_value = "10", value_parser = parse_duration)]
+    request_timeout: std::time::Duration,
 }
 
 /// Discover the authorities of the p2p network.
@@ -398,8 +457,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 opts.method,
                 opts.count,
                 opts.concurrency,
+                opts.connections,
+                opts.stagger_ms,
                 opts.request_timeout,
                 opts.timeout,
+            )
+            .await
+        }
+        Command::SoakLight(opts) => {
+            soak_light(
+                opts.chain,
+                opts.url,
+                opts.address,
+                opts.genesis,
+                opts.block,
+                opts.protocol,
+                opts.method,
+                opts.rate,
+                opts.duration,
+                opts.clients,
+                opts.max_concurrent,
+                opts.request_timeout,
             )
             .await
         }

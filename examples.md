@@ -287,10 +287,46 @@ Observed against `paseo-bulletin-next-rpc-node-0` (illustrative):
 | 32 | 773 | 27 (3.4%) | 186 req/s | 613 ms |
 | 96 | 571 | 229 (29%) | 484 req/s | 232 ms |
 
-Toward 10k: keep one connection, set `--count 10000 --concurrency 64`, raise
-`--timeout` to fit the run. (Breadth — many connections / peer ids to emulate many
-light clients — is a planned next knob; the server queue is global, so breadth
-tests starvation rather than bypassing the queue.)
+Toward 10k: `--count 10000 --concurrency 64` (raise `--timeout` to fit the run).
+For **breadth** — many distinct light clients rather than one deep window — add
+`--connections K` (K independent PeerIds, each running `--count` at `--concurrency`;
+total = `K × count`, total in-flight = `K × concurrency`). The server's queue is
+global, so breadth tests cross-client starvation rather than bypassing the queue.
+
+---
+
+## Soak testing (`soak-light`)
+
+`spam-light` is a closed-loop saturation sweep ("how hard can I push?").
+`soak-light` is the **open-loop** companion: it offers a fixed **rate** for a
+fixed **duration** with realistic client churn — to check a node stays healthy
+under sustained, possibly over-capacity load.
+
+```bash
+# Offer 4000 req/s for 1 hour, using 1000 distinct connections over the run.
+cargo run -p subp2p-explorer-cli -- soak-light \
+  --chain paseo-next-asset-hub --method revive_dotns:playground.dot \
+  --rate 4000 --duration 3600 --clients 1000
+```
+
+Model:
+- `--rate` is the offered request rate (a token-bucket paces it; the pool of
+  connections grows on demand to meet it). Drops above the node's capacity are
+  expected and reported (`shed`), not errors.
+- `--duration` is the run length in seconds.
+- `--clients` is the **total** number of connections opened over the run
+  (cumulative, *not* concurrent — concurrent emerges as ≈ rate × latency). Each
+  connection has a **fresh PeerId**, runs **1 request in flight**, and closes
+  after its derived share (`lifetime = rate × duration / clients`); a brand-new
+  connection replaces it. Churn rate = `clients / duration` new conns/s. Size
+  `--clients` so the budget spans the duration (a few × the steady concurrency);
+  too small and the pool drains before the end.
+- `--max-concurrent` caps simultaneous connections (safety backstop only).
+
+It prints a live progress line plus a **drift snapshot every 30 s** (rolling
+served/s, shed/s, concurrent) so hour-long trends are visible, and a final
+summary with offered/served/shed rates, **send→response** *and* **connection-setup**
+latency percentiles, the error breakdown, and per-method stats.
 
 ---
 

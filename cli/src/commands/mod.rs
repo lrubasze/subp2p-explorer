@@ -10,4 +10,6 @@ pub mod discover_peer;
 pub mod discovery;
 pub mod extrinsics;
 pub mod identity;
+pub mod light_common;
 pub mod light_spam;
+pub mod soak_light;
