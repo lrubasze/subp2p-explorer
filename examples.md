@@ -36,8 +36,25 @@ cargo run -p subp2p-explorer-cli -- spam-light --chain paseo-next-bulletin
 cargo run -p subp2p-explorer-cli -- spam-light --chain paseo-next-asset-hub
 ```
 
-Each of those issues `--count 100` requests at `--concurrency 8`. Everything the
-preset sets is overridable with the flags below.
+Available presets (each dials that chain's **collator node 0** by default and
+fetches genesis from its RPC):
+
+| `--chain` | RPC | default p2p host |
+|---|---|---|
+| `paseo-next-asset-hub` | `wss://paseo-asset-hub-next-rpc.polkadot.io` | `paseo-asset-hub-next-collator-node-0.parity-testnet.parity.io` |
+| `paseo-next-bulletin` | `wss://paseo-bulletin-next-rpc.polkadot.io` | `paseo-bulletin-next-rpc-node-0.polkadot.io` |
+| `summit-asset-hub` | `wss://summit-asset-hub-rpc.polkadot.io` | `summit-asset-hub-collator-node-0.parity-chains.parity.io` |
+| `summit-bulletin` | `wss://summit-bulletin-rpc.polkadot.io` | `summit-bulletin-collator-node-0.parity-chains.parity.io` |
+| `summit-people` | `wss://summit-people-rpc.polkadot.io` | `summit-people-collator-node-0.parity-chains.parity.io` |
+
+Each issues `--count 100` requests at `--concurrency 8`. Everything the preset sets
+is overridable with the flags below. (Summit also has `…-collator-node-1` /
+`…-rpc-node-{0,1}` hosts — override `--address` to pick one.)
+
+> Note: `revive_get_storage` / `revive_dotns` default to the **Paseo Next** dotNS
+> contract address, which doesn't exist on Summit — there they read a non-existent
+> contract (still real execution, ~1.4 KB proof-of-absence). For real Summit revive
+> reads, pass `--method "call:ReviveApi_get_storage:<H160><slotKey>"`.
 
 ---
 

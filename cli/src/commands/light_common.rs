@@ -40,14 +40,22 @@ pub(crate) struct SpamBehaviour {
 // Chain presets
 // ---------------------------------------------------------------------------
 
-/// Built-in Paseo Next chain presets (RPC url, default p2p host, default method
-/// mix). Everything is overridable on the command line.
+/// Built-in chain presets (RPC url, default p2p collator host, default method
+/// mix). Everything is overridable on the command line. Genesis is fetched from
+/// the preset RPC, so no relay-chain knowledge is needed — we dial the parachain
+/// node directly.
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum Chain {
     /// Paseo Next Asset Hub (revive / `ReviveApi_get_storage`).
     PaseoNextAssetHub,
     /// Paseo Next Bulletin (transaction storage).
     PaseoNextBulletin,
+    /// Web3 Summit Network Asset Hub (revive / `ReviveApi_get_storage`).
+    SummitAssetHub,
+    /// Web3 Summit Network Bulletin (transaction storage).
+    SummitBulletin,
+    /// Web3 Summit Network People (identity / individuality runtime).
+    SummitPeople,
 }
 
 impl Chain {
@@ -55,11 +63,14 @@ impl Chain {
         match self {
             Chain::PaseoNextAssetHub => "wss://paseo-asset-hub-next-rpc.polkadot.io",
             Chain::PaseoNextBulletin => "wss://paseo-bulletin-next-rpc.polkadot.io",
+            Chain::SummitAssetHub => "wss://summit-asset-hub-rpc.polkadot.io",
+            Chain::SummitBulletin => "wss://summit-bulletin-rpc.polkadot.io",
+            Chain::SummitPeople => "wss://summit-people-rpc.polkadot.io",
         }
     }
 
-    /// A default p2p host to dial (a guess for convenience; override with
-    /// `--address`). wss on :443 behind the ingress.
+    /// A default p2p collator host to dial (a guess for convenience; override
+    /// with `--address`). wss on :443 behind the ingress.
     pub(crate) fn address(&self) -> &'static str {
         match self {
             Chain::PaseoNextAssetHub => {
@@ -68,15 +79,25 @@ impl Chain {
             Chain::PaseoNextBulletin => {
                 "/dns4/paseo-bulletin-next-rpc-node-0.polkadot.io/tcp/443/wss"
             }
+            Chain::SummitAssetHub => {
+                "/dns4/summit-asset-hub-collator-node-0.parity-chains.parity.io/tcp/443/wss"
+            }
+            Chain::SummitBulletin => {
+                "/dns4/summit-bulletin-collator-node-0.parity-chains.parity.io/tcp/443/wss"
+            }
+            Chain::SummitPeople => {
+                "/dns4/summit-people-collator-node-0.parity-chains.parity.io/tcp/443/wss"
+            }
         }
     }
 
     pub(crate) fn default_methods(&self) -> &'static str {
         match self {
-            Chain::PaseoNextAssetHub => "revive_get_storage,account_nonce",
-            Chain::PaseoNextBulletin => {
+            Chain::PaseoNextAssetHub | Chain::SummitAssetHub => "revive_get_storage,account_nonce",
+            Chain::PaseoNextBulletin | Chain::SummitBulletin => {
                 "account_nonce,can_store,account_authorization,indexed_transactions"
             }
+            Chain::SummitPeople => "account_nonce",
         }
     }
 }
