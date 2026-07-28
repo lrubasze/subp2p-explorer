@@ -44,6 +44,18 @@ pub enum NotificationsToSwarm {
         sender: mpsc::Sender<Vec<u8>>,
     },
 
+    /// The remote refused the protocol while negotiating the handshake.
+    ///
+    /// Substrate rejects the substream without closing the connection when the
+    /// peer slots for our role are full, so a refused protocol is not the same
+    /// thing as a lost connection.
+    CustomProtocolRefused {
+        /// Id of the peer that refused us.
+        peer_id: PeerId,
+        /// The index of the protocol.
+        index: usize,
+    },
+
     /// The given protocol has been closed.
     ///
     /// Any data captured from [`CustomProtocolOpen`] is stale (ie the sender).
@@ -306,6 +318,10 @@ impl NetworkBehaviour for Notifications {
                     connection_id,
                     index,
                 );
+
+                self.propagate_event(ToSwarm::GenerateEvent(
+                    NotificationsToSwarm::CustomProtocolRefused { peer_id, index },
+                ));
             }
             NotificationsHandlerToBehavior::OpenDesiredByRemote { index } => {
                 // Note: extend to reject protocols for specific peers in the future.

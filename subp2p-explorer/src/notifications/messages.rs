@@ -31,14 +31,25 @@ pub struct BlockAnnouncesHandshake {
 }
 
 impl BlockAnnouncesHandshake {
-    pub fn from_genesis(genesis_hash: BlockHash) -> Self {
+    /// Handshake advertising `role`, claiming the genesis block as our best block.
+    ///
+    /// Substrate validates only `genesis_hash` when it decodes this handshake, so
+    /// claiming genesis as the best block is accepted for every role. The role
+    /// decides which peer slots the remote counts us against: light peers are
+    /// gated by `--in-peers-light`, full and authority peers by `--in-peers`.
+    pub fn from_genesis_with_role(genesis_hash: BlockHash, role: &ProtocolRole) -> Self {
         Self {
-            // Full node
-            roles: 4,
+            roles: role.encoded(),
             best_number: 0,
             best_hash: genesis_hash,
             genesis_hash,
         }
+    }
+
+    pub fn from_genesis(genesis_hash: BlockHash) -> Self {
+        // Historically hardcoded to the authority bit. Substrate's `Roles::is_full()`
+        // accepts it as a full node, so this is kept for callers that don't pick a role.
+        Self::from_genesis_with_role(genesis_hash, &ProtocolRole::Authority)
     }
 
     pub fn from_hex_genesis(genesis_hash: &str) -> Result<Self, FromHexError> {
@@ -114,5 +125,24 @@ mod tests {
         assert_eq!(ProtocolRole::FullNode.encoded(), 1);
         assert_eq!(ProtocolRole::LightNode.encoded(), 2);
         assert_eq!(ProtocolRole::Authority.encoded(), 4);
+    }
+
+    #[test]
+    fn block_announces_handshake_carries_role() {
+        let genesis = BlockHash::repeat_byte(0xab);
+
+        // The role is the first encoded byte, which is what the remote gates on.
+        for (role, byte) in [
+            (ProtocolRole::LightNode, 2u8),
+            (ProtocolRole::FullNode, 1),
+            (ProtocolRole::Authority, 4),
+        ] {
+            let handshake = BlockAnnouncesHandshake::from_genesis_with_role(genesis, &role);
+            assert_eq!(handshake.roles, byte);
+            assert_eq!(handshake.encode()[0], byte);
+        }
+
+        // `from_genesis` keeps sending the authority bit it always sent.
+        assert_eq!(BlockAnnouncesHandshake::from_genesis(genesis).roles, 4);
     }
 }

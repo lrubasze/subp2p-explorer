@@ -165,7 +165,8 @@ impl NotificationsHandler {
         // The transaction protocol substream will broadcast a vector of extrinsics that is scale-encoded.
         let tx = format!("/{}/transactions/1", genesis_string);
 
-        let block_announces = BlockAnnouncesHandshake::from_genesis(data.genesis_hash);
+        let block_announces =
+            BlockAnnouncesHandshake::from_genesis_with_role(data.genesis_hash, &data.node_role);
 
         let protocols = vec![
             ProtocolDetails {

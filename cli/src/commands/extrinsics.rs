@@ -54,6 +54,9 @@ pub async fn submit_extrinsics(
 
                     protocol_senders.insert((peer_id, index), sender);
                 }
+                NotificationsToSwarm::CustomProtocolRefused { peer_id, index } => {
+                    log::info!("Protocol refused peer={:?} index={:?}", peer_id, index);
+                }
                 NotificationsToSwarm::CustomProtocolClosed { peer_id, index } => {
                     log::info!("Protocol closed peer={:?} index={:?}", peer_id, index);
                 }
