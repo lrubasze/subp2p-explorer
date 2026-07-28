@@ -9,6 +9,7 @@ pub mod dial_peer;
 pub mod discover_peer;
 pub mod discovery;
 pub mod extrinsics;
+pub mod hold_peers;
 pub mod identity;
 pub mod light_common;
 pub mod light_spam;

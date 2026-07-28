@@ -14,6 +14,7 @@ use commands::{
     discover_peer::discover_peer,
     discovery::discover_network,
     extrinsics::submit_extrinsics,
+    hold_peers::{hold_peers, HoldRole},
     light_common::Chain,
     light_spam::spam_light,
     soak_light::soak_light,
@@ -33,6 +34,51 @@ enum Command {
     VerifyBootnodes(BootnodesOpts),
     SpamLight(SpamLightOpts),
     SoakLight(SoakLightOpts),
+    HoldPeers(HoldPeersOpts),
+}
+
+/// Open many cheap fake peers against one full node and hold them, to measure how
+/// many concurrent peers the node accepts.
+///
+/// The node gates inbound light peers with `--in-peers-light` and inbound full
+/// peers with `--in-peers`, both checked when the peer opens the block-announces
+/// substream. A holder opens that substream with the requested role and then does
+/// nothing, which is all the node's limit actually counts — so thousands of
+/// holders fit in one process, where real smoldot clients would not.
+///
+/// Needs no live chain state: pass `--genesis` and it runs without any RPC.
+#[derive(Debug, ClapParser)]
+pub struct HoldPeersOpts {
+    /// Chain preset (supplies a default p2p host and RPC url).
+    #[clap(long, short, value_enum)]
+    chain: Option<Chain>,
+    /// RPC endpoint, used only to fetch the genesis hash. Not needed if
+    /// --genesis is given.
+    #[clap(long, short)]
+    url: Option<String>,
+    /// Multiaddress of the full node to dial. Required unless --chain.
+    #[clap(long, short)]
+    address: Option<String>,
+    /// Hex-encoded genesis hash. Fetched from the RPC if omitted.
+    #[clap(long, short)]
+    genesis: Option<String>,
+    /// Role each holder advertises. This decides which of the node's limits
+    /// applies: light hits --in-peers-light, full and authority hit --in-peers.
+    #[clap(long, short, value_enum, default_value = "light")]
+    role: HoldRole,
+    /// Number of concurrent peers to open and hold.
+    #[clap(long, short, default_value = "100")]
+    peers: usize,
+    /// Gap between opening peers, in milliseconds. 0 opens them all at once.
+    #[clap(long, default_value = "10")]
+    ramp_ms: u64,
+    /// How long to hold, in seconds.
+    #[clap(long, short, value_parser = parse_duration)]
+    duration: std::time::Duration,
+    /// How long to keep a connection with no open substream, in seconds. Keeps
+    /// refused peers parked instead of reconnecting in a loop.
+    #[clap(long, default_value = "300", value_parser = parse_duration)]
+    idle_timeout: std::time::Duration,
 }
 
 /// Spam the `/<genesis>/light/2` request-response protocol of an appointed full
@@ -478,6 +524,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 opts.clients,
                 opts.max_concurrent,
                 opts.request_timeout,
+            )
+            .await
+        }
+        Command::HoldPeers(opts) => {
+            hold_peers(
+                opts.chain,
+                opts.url,
+                opts.address,
+                opts.genesis,
+                opts.role,
+                opts.peers,
+                opts.ramp_ms,
+                opts.duration,
+                opts.idle_timeout,
             )
             .await
         }
