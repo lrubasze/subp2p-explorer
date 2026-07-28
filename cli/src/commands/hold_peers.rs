@@ -64,6 +64,11 @@ impl HoldRole {
     }
 }
 
+/// Read the held gauge this long before the deadline. Holders wake at the
+/// deadline itself and release their slot on the way out, so reading the gauge
+/// after the deadline races their shutdown and under-reports.
+const HELD_SAMPLE_LEAD: Duration = Duration::from_millis(250);
+
 /// Lock-free counters shared by all holders, read by the orchestrator for the
 /// live progress line and the final summary.
 #[derive(Default)]
@@ -129,8 +134,9 @@ async fn build_swarm(
         .expect("Can construct WebSocket; qed")
         .with_behaviour(|_key| Notifications::new(data))
         .expect("Can construct behaviour; qed")
-        // A refused holder keeps its connection but has no open substream. Park it
-        // for the run instead of letting libp2p's short default close and churn it.
+        // Only governs our side. A refused holder has no open substream, and the
+        // node reaps such a connection after its own idle timeout (measured: 10.0s
+        // against a dev node), so this cannot keep a refused holder connected.
         .with_swarm_config(|config| config.with_idle_connection_timeout(idle_timeout))
         .build();
 
@@ -273,8 +279,9 @@ fn print_report(
     println!("offered:    {peers} peers (one every {ramp_ms} ms)");
     println!("duration:   {elapsed:.1}s");
     println!(
-        "held:       peak {} | steady {steady_held} at end of run",
+        "held:       peak {} | steady {steady_held} (sampled {:.0} ms before the end)",
         metrics.peak_held.load(Ordering::Relaxed),
+        HELD_SAMPLE_LEAD.as_millis(),
     );
     println!(
         "outcome:    connected={} accepted={} refused={} evicted={} dial_failed={}",
@@ -361,12 +368,15 @@ pub async fn hold_peers(
     let metrics = Arc::new(HoldMetrics::default());
     let start = Instant::now();
     let deadline = TokioInstant::now() + duration;
+    // Stop the orchestrator loop a moment early so the held gauge can be read
+    // before the holders wake at `deadline` and start releasing their slots.
+    let sample_at = TokioInstant::now() + duration.saturating_sub(HELD_SAMPLE_LEAD);
 
     println!("Opening peers...\n");
     let mut handles = Vec::with_capacity(peers);
     let mut opened = 0usize;
 
-    let final_sleep = tokio::time::sleep_until(deadline);
+    let final_sleep = tokio::time::sleep_until(sample_at);
     tokio::pin!(final_sleep);
     let mut spawn_tick = tokio::time::interval(Duration::from_millis(ramp_ms.max(1)));
     let mut progress_tick = tokio::time::interval(Duration::from_secs(1));
@@ -399,8 +409,12 @@ pub async fn hold_peers(
         }
     }
 
-    // Read the gauge before the holders wind down, otherwise it is always zero.
+    // Sampled `HELD_SAMPLE_LEAD` before the deadline: the holders are all still
+    // running, so this is the real steady-state count rather than a race with
+    // their shutdown.
     let steady_held = metrics.held.load(Ordering::Relaxed);
+
+    tokio::time::sleep_until(deadline).await;
     println!("\nDuration reached, draining {} peer(s)...", handles.len());
 
     let mut hold_times: Vec<u64> = join_all(handles)

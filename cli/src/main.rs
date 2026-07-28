@@ -75,8 +75,9 @@ pub struct HoldPeersOpts {
     /// How long to hold, in seconds.
     #[clap(long, short, value_parser = parse_duration)]
     duration: std::time::Duration,
-    /// How long to keep a connection with no open substream, in seconds. Keeps
-    /// refused peers parked instead of reconnecting in a loop.
+    /// How long we keep a connection with no open substream, in seconds. This
+    /// governs our side only: the node reaps a refused peer's connection after
+    /// its own idle timeout (10s by default), whatever this is set to.
     #[clap(long, default_value = "300", value_parser = parse_duration)]
     idle_timeout: std::time::Duration,
 }

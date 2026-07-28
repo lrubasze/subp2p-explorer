@@ -12,11 +12,11 @@
 # The node also caps total incoming connections at 10000, compiled in, so that
 # is the ceiling for this test.
 
-URL=ws://127.0.0.1:9944
-ADDRESS=/ip4/127.0.0.1/tcp/30333
+#URL=ws://127.0.0.1:9944
+#ADDRESS=/ip4/127.0.0.1/tcp/30333
 
-#URL=wss://kusama-rpc.polkadot.io
-#ADDRESS=/ip4/195.154.218.123/tcp/30333
+URL=wss://kusama-rpc.polkadot.io
+ADDRESS=/ip4/195.154.218.123/tcp/30333
 
 #URL=wss://paseo-asset-hub-next-rpc.polkadot.io
 #ADDRESS=/dns4/paseo-asset-hub-next-collator-node-0.parity-testnet.parity.io/tcp/443/wss
@@ -29,12 +29,15 @@ GENESIS=${GENESIS:-}
 ROLE=${ROLE:-light}
 PEERS=${PEERS:-1000}
 DURATION=${DURATION:-120}
-# Gap between opening peers. Keep a ramp: with RAMP_MS=0 the node's slot
-# accounting lags the burst and accepts more peers than its limit allows
-# (measured: 50 full peers accepted against --in-peers 32, versus exactly 32
-# when ramped), so a burst reports an inflated ceiling.
+# Gap between opening peers. Keep a ramp: with RAMP_MS=0 the node admits the
+# whole burst before its slot accounting catches up, which inflates the peak.
+# Measured against --in-peers 32: a burst of 50 full peers was all admitted
+# (bounded only by in_peers + in_peers_light, the peerset's inbound cap), then
+# converged to exactly 32. A ramped run reports 32 for both peak and steady.
+# So for a burst run, read steady and ignore peak.
 RAMP_MS=${RAMP_MS:-10}
-# keeps refused peers parked instead of reconnecting in a loop
+# Our side only. A refused peer is dropped by the node after its own idle
+# timeout (measured: 10.0s against a dev node) regardless of this value.
 IDLE_TIMEOUT=${IDLE_TIMEOUT:-300}
 
 export RUST_LOG=info
