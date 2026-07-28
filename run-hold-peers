@@ -1,0 +1,49 @@
+#!/bin/bash
+
+# Hold many fake light peers against one node to see how many it accepts.
+#
+# The node under test gates inbound light peers with --in-peers-light (default
+# 100) and inbound full peers with --in-peers (default 32). Raise whichever one
+# you are measuring, or the run just stops at the default. That is why the
+# default target below is a local node rather than a public one:
+#
+#   polkadot --dev --in-peers-light 2000 --port 30333 --rpc-port 9944
+#
+# The node also caps total incoming connections at 10000, compiled in, so that
+# is the ceiling for this test.
+
+URL=ws://127.0.0.1:9944
+ADDRESS=/ip4/127.0.0.1/tcp/30333
+
+#URL=wss://kusama-rpc.polkadot.io
+#ADDRESS=/ip4/195.154.218.123/tcp/30333
+
+#URL=wss://paseo-asset-hub-next-rpc.polkadot.io
+#ADDRESS=/dns4/paseo-asset-hub-next-collator-node-0.parity-testnet.parity.io/tcp/443/wss
+
+# Set GENESIS to skip the RPC entirely. Unlike spam-light / soak-light this
+# command needs no live chain state, only the genesis hash.
+GENESIS=${GENESIS:-}
+
+# light hits --in-peers-light, full and authority hit --in-peers
+ROLE=${ROLE:-light}
+PEERS=${PEERS:-1000}
+DURATION=${DURATION:-120}
+# Gap between opening peers. Keep a ramp: with RAMP_MS=0 the node's slot
+# accounting lags the burst and accepts more peers than its limit allows
+# (measured: 50 full peers accepted against --in-peers 32, versus exactly 32
+# when ramped), so a burst reports an inflated ceiling.
+RAMP_MS=${RAMP_MS:-10}
+# keeps refused peers parked instead of reconnecting in a loop
+IDLE_TIMEOUT=${IDLE_TIMEOUT:-300}
+
+export RUST_LOG=info
+
+if [ -n "$GENESIS" ]; then
+    CHAIN_SOURCE="--genesis $GENESIS"
+else
+    CHAIN_SOURCE="--url $URL"
+fi
+
+# Build once: cargo build --release -p subp2p-explorer-cli
+./target/release/subp2p-explorer-cli hold-peers   $CHAIN_SOURCE   --address $ADDRESS   --role $ROLE --peers $PEERS --ramp-ms $RAMP_MS --duration $DURATION --idle-timeout $IDLE_TIMEOUT
