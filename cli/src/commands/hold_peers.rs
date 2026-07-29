@@ -59,7 +59,7 @@ pub enum HoldRole {
 }
 
 impl HoldRole {
-    fn protocol_role(&self) -> ProtocolRole {
+    pub(crate) fn protocol_role(&self) -> ProtocolRole {
         match self {
             HoldRole::Light => ProtocolRole::LightNode,
             HoldRole::Full => ProtocolRole::FullNode,
@@ -71,15 +71,15 @@ impl HoldRole {
 /// Lock-free counters shared by all holders, read by the orchestrator for the
 /// live progress line and the final summary.
 #[derive(Default)]
-struct HoldMetrics {
+pub(crate) struct HoldMetrics {
     /// Holders that were dialed.
-    dialed: AtomicU64,
+    pub dialed: AtomicU64,
     /// Dials that reached an established connection.
-    connected: AtomicU64,
+    pub connected: AtomicU64,
     /// Dials that never connected.
-    dial_failed: AtomicU64,
+    pub dial_failed: AtomicU64,
     /// Holders currently holding the block-announces substream.
-    held: AtomicU64,
+    pub held: AtomicU64,
     peak_held: AtomicU64,
     /// Cumulative block-announces opens (a holder re-opening counts again).
     accepted: AtomicU64,
@@ -88,21 +88,21 @@ struct HoldMetrics {
     /// Block-announces substreams closed after having been held.
     evicted: AtomicU64,
     /// Block announcements received and dropped.
-    announces: AtomicU64,
+    pub announces: AtomicU64,
 }
 
 /// One block announcement as seen by one holder.
-struct Arrival {
+pub(crate) struct Arrival {
     /// Hash of the announcement bytes. The node builds one message per block and
     /// sends the same bytes to every peer, so this groups arrivals of the same
     /// block without having to decode the header.
-    key: u64,
+    pub key: u64,
     /// Block number, when the header decoded.
-    number: Option<u32>,
+    pub number: Option<u32>,
     /// Timestamped in the holder task, as close to the event as we can get.
-    at: Instant,
+    pub at: Instant,
     /// Peers held when this arrival happened — the coverage denominator.
-    held: u64,
+    pub held: u64,
 }
 
 /// Per-block view of one announcement, accumulated across every holder.
@@ -189,7 +189,7 @@ impl HoldMetrics {
 
 /// Build a swarm for one holder: a fresh identity and nothing but the
 /// notification protocols.
-async fn build_swarm(
+pub(crate) async fn build_swarm(
     data: ProtocolsData,
     idle_timeout: Duration,
 ) -> Result<Swarm<Notifications>, Box<dyn Error>> {
@@ -222,7 +222,7 @@ async fn build_swarm(
 
 /// Run one holder: dial, then stay polled until `stop` is set, holding whatever
 /// the node granted us. Returns how long the node took to accept us, if it did.
-async fn run_peer(
+pub(crate) async fn run_peer(
     id: usize,
     addr: Multiaddr,
     data: ProtocolsData,

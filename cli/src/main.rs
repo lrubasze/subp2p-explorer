@@ -17,6 +17,7 @@ use commands::{
     hold_peers::{hold_peers, HoldRole},
     light_common::Chain,
     light_spam::spam_light,
+    probe_announces::probe_announces,
     soak_light::soak_light,
 };
 use jsonrpsee::client_transport::ws::Url;
@@ -35,6 +36,50 @@ enum Command {
     SpamLight(SpamLightOpts),
     SoakLight(SoakLightOpts),
     HoldPeers(HoldPeersOpts),
+    ProbeAnnounces(ProbeAnnouncesOpts),
+}
+
+/// Measure block-announcement quality from a small, unloaded process.
+///
+/// Run this alongside a `hold-peers` process: that one generates the peer load,
+/// this one measures. Because it lives in its own process with only a handful of
+/// peers, its timings are not distorted by the load.
+///
+/// The node's RPC head stream is the reference clock. Both timestamps are taken
+/// here, so no clock synchronisation is needed, and the RPC path does not care how
+/// many peers the node has. A growing gap between "RPC reported block N" and "our
+/// peers were told about block N" is node-side degradation. A block the RPC
+/// reported but no probe peer was told about is a dropped announcement.
+#[derive(Debug, ClapParser)]
+pub struct ProbeAnnouncesOpts {
+    /// Chain preset (supplies a default p2p host and RPC url).
+    #[clap(long, short, value_enum)]
+    chain: Option<Chain>,
+    /// RPC endpoint. Required: it is the reference clock, not just a genesis
+    /// lookup.
+    #[clap(long, short)]
+    url: Option<String>,
+    /// Multiaddress of the full node to dial. Required unless --chain.
+    #[clap(long, short)]
+    address: Option<String>,
+    /// Hex-encoded genesis hash. Fetched from the RPC if omitted.
+    #[clap(long, short)]
+    genesis: Option<String>,
+    /// Role the probe peers advertise.
+    #[clap(long, short, value_enum, default_value = "light")]
+    role: HoldRole,
+    /// Number of probe peers. Keep this small — the point is to stay unloaded.
+    #[clap(long, short, default_value = "4")]
+    peers: usize,
+    /// How long to measure, in seconds.
+    #[clap(long, short, value_parser = parse_duration)]
+    duration: std::time::Duration,
+    /// How long we keep a connection with no open substream, in seconds.
+    #[clap(long, default_value = "300", value_parser = parse_duration)]
+    idle_timeout: std::time::Duration,
+    /// Grace period, in seconds, for the probe peers to connect before measuring.
+    #[clap(long, default_value = "30", value_parser = parse_duration)]
+    connect_timeout: std::time::Duration,
 }
 
 /// Open many cheap fake peers against one full node and hold them, to measure how
@@ -543,6 +588,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 opts.role,
                 opts.peers,
                 opts.ramp_ms,
+                opts.duration,
+                opts.idle_timeout,
+                opts.connect_timeout,
+            )
+            .await
+        }
+        Command::ProbeAnnounces(opts) => {
+            probe_announces(
+                opts.chain,
+                opts.url,
+                opts.address,
+                opts.genesis,
+                opts.role,
+                opts.peers,
                 opts.duration,
                 opts.idle_timeout,
                 opts.connect_timeout,

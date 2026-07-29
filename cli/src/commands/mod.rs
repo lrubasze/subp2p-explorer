@@ -13,4 +13,5 @@ pub mod hold_peers;
 pub mod identity;
 pub mod light_common;
 pub mod light_spam;
+pub mod probe_announces;
 pub mod soak_light;
