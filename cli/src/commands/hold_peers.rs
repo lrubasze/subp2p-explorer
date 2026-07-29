@@ -24,11 +24,14 @@
 
 use crate::commands::authorities::fetch_genesis_hash;
 use crate::commands::light_common::{percentile_ms, Chain};
+use codec::{Compact, Decode};
 use futures::{future::join_all, FutureExt, StreamExt};
 use jsonrpsee::client_transport::ws::Url;
 use libp2p::{identity, swarm::SwarmEvent, Multiaddr, Swarm};
 use primitive_types::H256;
+use std::collections::HashMap;
 use std::error::Error;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -39,7 +42,7 @@ use subp2p_explorer::{
     },
     BLOCK_ANNOUNCES_INDEX,
 };
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::time::Instant as TokioInstant;
 
 /// The role a holder advertises in the block-announces handshake.
@@ -86,6 +89,84 @@ struct HoldMetrics {
     evicted: AtomicU64,
     /// Block announcements received and dropped.
     announces: AtomicU64,
+}
+
+/// One block announcement as seen by one holder.
+struct Arrival {
+    /// Hash of the announcement bytes. The node builds one message per block and
+    /// sends the same bytes to every peer, so this groups arrivals of the same
+    /// block without having to decode the header.
+    key: u64,
+    /// Block number, when the header decoded.
+    number: Option<u32>,
+    /// Timestamped in the holder task, as close to the event as we can get.
+    at: Instant,
+    /// Peers held when this arrival happened — the coverage denominator.
+    held: u64,
+}
+
+/// Per-block view of one announcement, accumulated across every holder.
+struct BlockObs {
+    number: Option<u32>,
+    first: Instant,
+    last: Instant,
+    /// Holders that received this block.
+    count: u64,
+    /// Peers held when this block first reached us.
+    held_at_first: u64,
+}
+
+/// A `BlockAnnounce` begins with the block header, which begins with a 32-byte
+/// parent hash followed by the block number as a compact integer. That is all we
+/// want, so skip the parent hash and decode the number rather than modelling the
+/// whole header.
+fn announced_block_number(bytes: &[u8]) -> Option<u32> {
+    let mut rest = bytes.get(32..)?;
+    Compact::<u32>::decode(&mut rest)
+        .ok()
+        .map(|number| number.0)
+}
+
+/// Group key for one announcement: a hash of its bytes.
+fn announcement_key(bytes: &[u8]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Fold every holder's arrivals into one observation per block. Runs as its own
+/// task so holders never block on aggregation, and ends when the last holder
+/// drops its sender.
+async fn collect_arrivals(
+    mut arrivals: mpsc::UnboundedReceiver<Arrival>,
+) -> HashMap<u64, BlockObs> {
+    let mut blocks: HashMap<u64, BlockObs> = HashMap::new();
+
+    while let Some(arrival) = arrivals.recv().await {
+        blocks
+            .entry(arrival.key)
+            // Arrivals from different holders interleave, so first and last both
+            // need a comparison rather than assuming arrival order.
+            .and_modify(|obs| {
+                obs.count += 1;
+                if arrival.at < obs.first {
+                    obs.first = arrival.at;
+                    obs.held_at_first = arrival.held;
+                }
+                if arrival.at > obs.last {
+                    obs.last = arrival.at;
+                }
+            })
+            .or_insert(BlockObs {
+                number: arrival.number,
+                first: arrival.at,
+                last: arrival.at,
+                count: 1,
+                held_at_first: arrival.held,
+            });
+    }
+
+    blocks
 }
 
 impl HoldMetrics {
@@ -147,6 +228,7 @@ async fn run_peer(
     data: ProtocolsData,
     idle_timeout: Duration,
     mut stop: watch::Receiver<bool>,
+    arrivals: mpsc::UnboundedSender<Arrival>,
     metrics: Arc<HoldMetrics>,
 ) -> Option<u64> {
     let mut swarm = match build_swarm(data, idle_timeout).await {
@@ -219,10 +301,18 @@ async fn run_peer(
                         metrics.evicted.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                SwarmEvent::Behaviour(NotificationsToSwarm::Notification { index, .. })
+                SwarmEvent::Behaviour(NotificationsToSwarm::Notification { index, message, .. })
                     if index == BLOCK_ANNOUNCES_INDEX =>
                 {
+                    // Stamp the time first, before any work on the message.
+                    let at = Instant::now();
                     metrics.announces.fetch_add(1, Ordering::Relaxed);
+                    let _ = arrivals.send(Arrival {
+                        key: announcement_key(&message),
+                        number: announced_block_number(&message),
+                        at,
+                        held: metrics.held.load(Ordering::Relaxed),
+                    });
                 }
                 _ => {}
             },
@@ -300,11 +390,6 @@ fn print_report(
         percentile_ms(hold_times, 99),
         hold_times.len(),
     );
-    println!(
-        "announces:  {} received and dropped",
-        metrics.announces.load(Ordering::Relaxed)
-    );
-
     let peak = metrics.peak_held.load(Ordering::Relaxed);
     if metrics.refused.load(Ordering::Relaxed) > 0 {
         println!(
@@ -312,6 +397,99 @@ fn print_report(
         );
     } else if peak >= peers as u64 {
         println!("\nEvery offered peer was held, so the node's limit is above {peers}.");
+    }
+}
+
+/// Report announcement fan-out: how long the node took to reach every holder
+/// with the same block, and whether every holder got it at all.
+///
+/// The node announces a block by looping over its peers one at a time, and the
+/// send is fire-and-forget — a peer whose buffer is full is skipped silently. So
+/// spread grows with peer count, and coverage below 100% means dropped
+/// announcements.
+///
+/// Only blocks first seen during the hold window are reported. Grouping is by
+/// message bytes, and the node re-announces a block with identical bytes, so a
+/// block first seen during the ramp merges two rounds that are seconds apart and
+/// whose peer counts differ — that produced coverage above 100% and a spread of
+/// seconds. During the hold window the peer set is stable, and a re-announce
+/// reaches nobody new because the node tracks what each peer has already seen.
+///
+/// Caveat: at high peer counts these timings include our own scheduling delay,
+/// since every holder shares one process. Treat them as an upper bound on what
+/// the node is responsible for.
+fn print_announcement_quality(blocks: &HashMap<u64, BlockObs>, hold_start: Instant) {
+    let total = blocks.len();
+    let blocks: Vec<&BlockObs> = blocks
+        .values()
+        .filter(|obs| obs.first >= hold_start)
+        .collect();
+
+    if blocks.is_empty() {
+        println!(
+            "announce:   nothing received during the hold window ({} before it, not comparable)",
+            total
+        );
+        return;
+    }
+
+    let received: u64 = blocks.iter().map(|obs| obs.count).sum();
+    let mut spreads: Vec<u64> = blocks
+        .iter()
+        .map(|obs| obs.last.duration_since(obs.first).as_micros() as u64)
+        .collect();
+    spreads.sort_unstable();
+
+    println!(
+        "announce:   {received} received over {} announcement(s) in the hold window ({} earlier one(s) skipped)",
+        blocks.len(),
+        total - blocks.len(),
+    );
+    println!(
+        "spread ms:  p50={:.1} p90={:.1} p99={:.1} max={:.1} (first to last holder, same block)",
+        percentile_ms(&spreads, 50),
+        percentile_ms(&spreads, 90),
+        percentile_ms(&spreads, 99),
+        percentile_ms(&spreads, 100),
+    );
+
+    let mut rows: Vec<(f64, &&BlockObs)> = blocks
+        .iter()
+        .filter(|obs| obs.held_at_first > 0)
+        .map(|obs| (obs.count as f64 / obs.held_at_first as f64, obs))
+        .collect();
+    if !rows.is_empty() {
+        rows.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("coverage is finite; qed"));
+        let mean = rows.iter().map(|(cov, _)| cov).sum::<f64>() / rows.len() as f64;
+        let incomplete = rows
+            .iter()
+            .filter(|(_, obs)| obs.count < obs.held_at_first)
+            .count();
+        let (worst_cov, worst) = rows[0];
+        println!(
+            "coverage:   mean {:.1}% | worst {:.1}% ({} of {} holders{}) | {incomplete} of {} announcement(s) incomplete",
+            mean * 100.0,
+            worst_cov * 100.0,
+            worst.count,
+            worst.held_at_first,
+            worst
+                .number
+                .map(|number| format!(" on #{number}"))
+                .unwrap_or_default(),
+            rows.len(),
+        );
+    }
+
+    let mut numbers: Vec<u32> = blocks.iter().filter_map(|obs| obs.number).collect();
+    numbers.sort_unstable();
+    numbers.dedup();
+    if let (Some(first), Some(last)) = (numbers.first(), numbers.last()) {
+        let span = (last - first + 1) as usize;
+        let missing = span.saturating_sub(numbers.len());
+        println!(
+            "blocks:     #{first}..#{last} | {} seen | {missing} number(s) never announced to us",
+            numbers.len(),
+        );
     }
 }
 
@@ -372,6 +550,9 @@ pub async fn hold_peers(
     // Holders run until this is set rather than until a fixed instant, so the
     // hold window can start once the last peer has connected.
     let (stop_tx, stop_rx) = watch::channel(false);
+    // Announcement arrivals are aggregated off the holder path.
+    let (arrivals_tx, arrivals_rx) = mpsc::unbounded_channel();
+    let collector = tokio::spawn(collect_arrivals(arrivals_rx));
 
     // Phase 1: open every peer on the ramp, then let the dials settle. Opening
     // 10000 peers 10 ms apart takes 100 s on its own, so this has to finish
@@ -435,6 +616,7 @@ pub async fn hold_peers(
                         data.clone(),
                         idle_timeout,
                         stop_rx.clone(),
+                        arrivals_tx.clone(),
                         metrics.clone(),
                     )));
                 }
@@ -494,6 +676,11 @@ pub async fn hold_peers(
         .flatten()
         .collect();
 
+    // Every holder has dropped its sender by now; drop ours so the collector
+    // sees the channel close and returns what it aggregated.
+    drop(arrivals_tx);
+    let blocks = collector.await.unwrap_or_default();
+
     print_report(
         &metrics,
         &mut hold_times,
@@ -507,6 +694,7 @@ pub async fn hold_peers(
         connect_secs,
         hold_secs,
     );
+    print_announcement_quality(&blocks, hold_start);
 
     Ok(())
 }
