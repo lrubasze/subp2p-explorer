@@ -39,6 +39,7 @@ use subp2p_explorer::{
     },
     BLOCK_ANNOUNCES_INDEX,
 };
+use tokio::sync::watch;
 use tokio::time::Instant as TokioInstant;
 
 /// The role a holder advertises in the block-announces handshake.
@@ -63,11 +64,6 @@ impl HoldRole {
         }
     }
 }
-
-/// Read the held gauge this long before the deadline. Holders wake at the
-/// deadline itself and release their slot on the way out, so reading the gauge
-/// after the deadline races their shutdown and under-reports.
-const HELD_SAMPLE_LEAD: Duration = Duration::from_millis(250);
 
 /// Lock-free counters shared by all holders, read by the orchestrator for the
 /// live progress line and the final summary.
@@ -143,14 +139,14 @@ async fn build_swarm(
     Ok(swarm)
 }
 
-/// Run one holder: dial, then stay polled until the deadline, holding whatever
+/// Run one holder: dial, then stay polled until `stop` is set, holding whatever
 /// the node granted us. Returns how long the node took to accept us, if it did.
 async fn run_peer(
     id: usize,
     addr: Multiaddr,
     data: ProtocolsData,
     idle_timeout: Duration,
-    deadline: TokioInstant,
+    mut stop: watch::Receiver<bool>,
     metrics: Arc<HoldMetrics>,
 ) -> Option<u64> {
     let mut swarm = match build_swarm(data, idle_timeout).await {
@@ -174,10 +170,11 @@ async fn run_peer(
     let mut holding = false;
     let mut time_to_hold = None;
 
-    let sleep = tokio::time::sleep_until(deadline);
-    tokio::pin!(sleep);
-
     loop {
+        if *stop.borrow() {
+            break;
+        }
+
         futures::select! {
             event = swarm.select_next_some().fuse() => match event {
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
@@ -229,7 +226,11 @@ async fn run_peer(
                 }
                 _ => {}
             },
-            _ = (&mut sleep).fuse() => break,
+            // The orchestrator reads the held count before setting this, so a
+            // holder can never release its slot before that count is taken.
+            changed = stop.changed().fuse() => if changed.is_err() {
+                break;
+            },
         }
     }
 
@@ -240,10 +241,9 @@ async fn run_peer(
     time_to_hold
 }
 
-fn print_progress(metrics: &HoldMetrics, start: Instant, opened: usize, peers: usize) {
+fn print_progress(metrics: &HoldMetrics, phase: &str, elapsed: f64, opened: usize, peers: usize) {
     print!(
-        "\r  t={:.0}s offered={opened}/{peers} connected={} held={}(peak {}) refused={} evicted={} announces={}   ",
-        start.elapsed().as_secs_f64(),
+        "\r  [{phase}] t={elapsed:.0}s offered={opened}/{peers} connected={} held={}(peak {}) refused={} evicted={} announces={}   ",
         metrics.connected.load(Ordering::Relaxed),
         metrics.held.load(Ordering::Relaxed),
         metrics.peak_held.load(Ordering::Relaxed),
@@ -263,8 +263,10 @@ fn print_report(
     role: HoldRole,
     peers: usize,
     ramp_ms: u64,
+    held_at_start: u64,
     steady_held: u64,
-    elapsed: f64,
+    connect_secs: f64,
+    hold_secs: f64,
 ) {
     hold_times.sort_unstable();
 
@@ -277,11 +279,11 @@ fn print_report(
         role.protocol_role().encoded()
     );
     println!("offered:    {peers} peers (one every {ramp_ms} ms)");
-    println!("duration:   {elapsed:.1}s");
+    println!("connect:    {connect_secs:.1}s to dial every peer and let the dials settle");
+    println!("hold:       {hold_secs:.1}s window, timed from the end of connect");
     println!(
-        "held:       peak {} | steady {steady_held} (sampled {:.0} ms before the end)",
+        "held:       peak {} | {held_at_start} at window start | {steady_held} at window end",
         metrics.peak_held.load(Ordering::Relaxed),
-        HELD_SAMPLE_LEAD.as_millis(),
     );
     println!(
         "outcome:    connected={} accepted={} refused={} evicted={} dial_failed={}",
@@ -325,6 +327,7 @@ pub async fn hold_peers(
     ramp_ms: u64,
     duration: Duration,
     idle_timeout: Duration,
+    connect_timeout: Duration,
 ) -> Result<(), Box<dyn Error>> {
     let peers = peers.max(1);
 
@@ -359,33 +362,64 @@ pub async fn hold_peers(
         role.protocol_role().encoded()
     );
     println!(
-        "Hold:       peers={peers} duration={:.0}s (one new peer every {ramp_ms} ms, idle timeout {:.0}s)",
+        "Hold:       peers={peers} hold={:.0}s after all peers connect (one new peer every {ramp_ms} ms, idle timeout {:.0}s)",
         duration.as_secs_f64(),
         idle_timeout.as_secs_f64(),
     );
 
     let multiaddr: Multiaddr = address.parse()?;
     let metrics = Arc::new(HoldMetrics::default());
-    let start = Instant::now();
-    let deadline = TokioInstant::now() + duration;
-    // Stop the orchestrator loop a moment early so the held gauge can be read
-    // before the holders wake at `deadline` and start releasing their slots.
-    let sample_at = TokioInstant::now() + duration.saturating_sub(HELD_SAMPLE_LEAD);
+    // Holders run until this is set rather than until a fixed instant, so the
+    // hold window can start once the last peer has connected.
+    let (stop_tx, stop_rx) = watch::channel(false);
 
+    // Phase 1: open every peer on the ramp, then let the dials settle. Opening
+    // 10000 peers 10 ms apart takes 100 s on its own, so this has to finish
+    // before the hold clock starts or a long ramp eats the whole window.
+    //
+    // The target peer count may never be held — the node refuses everything past
+    // its limit and reaps those connections — so the exit condition is about
+    // dials, not about holders: every peer dialed, and every dial resolved one
+    // way or the other, with `connect_timeout` as the backstop for a dial that
+    // neither connects nor fails.
     println!("Opening peers...\n");
+    let connect_start = Instant::now();
     let mut handles = Vec::with_capacity(peers);
     let mut opened = 0usize;
 
-    let final_sleep = tokio::time::sleep_until(sample_at);
-    tokio::pin!(final_sleep);
     let mut spawn_tick = tokio::time::interval(Duration::from_millis(ramp_ms.max(1)));
     let mut progress_tick = tokio::time::interval(Duration::from_secs(1));
+    let mut settle_tick = tokio::time::interval(Duration::from_millis(100));
     spawn_tick.tick().await;
     progress_tick.tick().await;
+    settle_tick.tick().await;
+
+    // A dial has resolved once it either connected or failed.
+    let resolved = |m: &HoldMetrics| {
+        m.connected.load(Ordering::Relaxed) + m.dial_failed.load(Ordering::Relaxed)
+    };
+    // Armed only once every peer has been opened, so the ramp is not on its clock.
+    let mut resolve_deadline: Option<TokioInstant> = None;
 
     loop {
+        if opened >= peers {
+            if resolved(&metrics) >= peers as u64 {
+                break;
+            }
+            let deadline =
+                *resolve_deadline.get_or_insert_with(|| TokioInstant::now() + connect_timeout);
+            if TokioInstant::now() >= deadline {
+                println!(
+                    "\n  warning: only {}/{peers} dials resolved within {:.0}s of the last one \
+                     being opened; starting the hold window anyway",
+                    resolved(&metrics),
+                    connect_timeout.as_secs_f64(),
+                );
+                break;
+            }
+        }
+
         futures::select! {
-            _ = (&mut final_sleep).fuse() => break,
             _ = spawn_tick.tick().fuse() => {
                 // `--ramp-ms 0` means open everything at once; otherwise one per tick.
                 let batch = if ramp_ms == 0 { peers - opened } else { 1 };
@@ -400,22 +434,58 @@ pub async fn hold_peers(
                         multiaddr.clone(),
                         data.clone(),
                         idle_timeout,
-                        deadline,
+                        stop_rx.clone(),
                         metrics.clone(),
                     )));
                 }
             }
-            _ = progress_tick.tick().fuse() => print_progress(&metrics, start, opened, peers),
+            // Re-checks the loop condition while nothing else is due.
+            _ = settle_tick.tick().fuse() => {}
+            _ = progress_tick.tick().fuse() => print_progress(
+                &metrics,
+                "connect",
+                connect_start.elapsed().as_secs_f64(),
+                opened,
+                peers,
+            ),
         }
     }
 
-    // Sampled `HELD_SAMPLE_LEAD` before the deadline: the holders are all still
-    // running, so this is the real steady-state count rather than a race with
-    // their shutdown.
-    let steady_held = metrics.held.load(Ordering::Relaxed);
+    let connect_secs = connect_start.elapsed().as_secs_f64();
+    // How many we actually had when the window opened, which for a target past
+    // the node's limit is well below `peers`.
+    let held_at_start = metrics.held.load(Ordering::Relaxed);
+    println!(
+        "\n\nAll {peers} peers dialed in {connect_secs:.1}s ({} connected, {} failed, {held_at_start} held). Holding for {:.0}s...\n",
+        metrics.connected.load(Ordering::Relaxed),
+        metrics.dial_failed.load(Ordering::Relaxed),
+        duration.as_secs_f64(),
+    );
 
-    tokio::time::sleep_until(deadline).await;
-    println!("\nDuration reached, draining {} peer(s)...", handles.len());
+    // Phase 2: the hold window proper.
+    let hold_start = Instant::now();
+    let hold_sleep = tokio::time::sleep_until(TokioInstant::now() + duration);
+    tokio::pin!(hold_sleep);
+
+    loop {
+        futures::select! {
+            _ = (&mut hold_sleep).fuse() => break,
+            _ = progress_tick.tick().fuse() => print_progress(
+                &metrics,
+                "hold",
+                hold_start.elapsed().as_secs_f64(),
+                opened,
+                peers,
+            ),
+        }
+    }
+
+    let hold_secs = hold_start.elapsed().as_secs_f64();
+    // Read the count before telling the holders to stop, so none of them can
+    // release its slot first.
+    let steady_held = metrics.held.load(Ordering::Relaxed);
+    let _ = stop_tx.send(true);
+    println!("\nHold window over, draining {} peer(s)...", handles.len());
 
     let mut hold_times: Vec<u64> = join_all(handles)
         .await
@@ -432,8 +502,10 @@ pub async fn hold_peers(
         role,
         peers,
         ramp_ms,
+        held_at_start,
         steady_held,
-        start.elapsed().as_secs_f64().max(0.001),
+        connect_secs,
+        hold_secs,
     );
 
     Ok(())

@@ -72,9 +72,15 @@ pub struct HoldPeersOpts {
     /// Gap between opening peers, in milliseconds. 0 opens them all at once.
     #[clap(long, default_value = "10")]
     ramp_ms: u64,
-    /// How long to hold, in seconds.
+    /// How long to hold, in seconds. Timed from the moment every peer has
+    /// connected, not from process start, so a long ramp does not eat into it.
     #[clap(long, short, value_parser = parse_duration)]
     duration: std::time::Duration,
+    /// Grace period, in seconds, for dials to settle after the last peer was
+    /// opened. Once it expires the hold window starts regardless, so a dial that
+    /// never connects or fails cannot stall the run.
+    #[clap(long, default_value = "30", value_parser = parse_duration)]
+    connect_timeout: std::time::Duration,
     /// How long we keep a connection with no open substream, in seconds. This
     /// governs our side only: the node reaps a refused peer's connection after
     /// its own idle timeout (10s by default), whatever this is set to.
@@ -539,6 +545,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 opts.ramp_ms,
                 opts.duration,
                 opts.idle_timeout,
+                opts.connect_timeout,
             )
             .await
         }
