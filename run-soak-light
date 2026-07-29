@@ -8,9 +8,10 @@ ADDRESS=/ip4/195.154.218.123/tcp/30333
 #URL=wss://paseo-asset-hub-next-rpc.polkadot.io
 #ADDRESS=/dns4/paseo-asset-hub-next-collator-node-0.parity-testnet.parity.io/tcp/443/wss
 
-#METHOD="account_nonce"
-METHOD="account_nonce,ParachainHost_candidate_events,ParachainHost_disputes,ParachainHost_validators,BabeApi_current_epoch,GrandpaApi_grandpa_authorities,Metadata_metadata"
+#METHOD_DFLT="account_nonce"
+METHOD_DFLT="account_nonce,ParachainHost_candidate_events,ParachainHost_disputes,ParachainHost_validators,BabeApi_current_epoch,GrandpaApi_grandpa_authorities,Metadata_metadata"
 
+METHOD=${METHOD:-$METHOD_DFLT}
 DURATION=${DURATION:-120}
 RATE=${RATE:-6000}
 CLIENTS=${CLIENTS:-1000}
