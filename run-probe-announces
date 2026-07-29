@@ -1,0 +1,53 @@
+#!/bin/bash
+
+# Measure block-announcement quality from a small, unloaded process.
+#
+# Run this *alongside* run-hold-peers, pointed at the same node:
+#
+#   PEERS=2000 DURATION=300 ./run-hold-peers &     # generates the load
+#   DURATION=60 ./run-probe-announces              # measures, in its own process
+#
+# hold-peers reports spread and coverage too, but with thousands of peers in one
+# process its timings include its own scheduling delay. This one holds only a few
+# peers, so it stays responsive however loaded the other process is.
+#
+# It compares two paths out of the same node: the RPC head stream, which does not
+# care how many peers the node has, against the p2p announcements its peers
+# receive. Both are timestamped here, so the gap between them is the node's
+# announcement delay. Measured against a dev node: 0.2 ms idle, 6.8 ms with 2000
+# holders attached.
+#
+# A block the RPC reported that no probe peer was told about is a dropped
+# announcement.
+
+#URL=ws://127.0.0.1:9944
+#ADDRESS=/ip4/127.0.0.1/tcp/30333
+
+URL=wss://kusama-rpc.polkadot.io
+ADDRESS=/ip4/195.154.218.123/tcp/30333
+
+#URL=wss://paseo-asset-hub-next-rpc.polkadot.io
+#ADDRESS=/dns4/paseo-asset-hub-next-collator-node-0.parity-testnet.parity.io/tcp/443/wss
+
+# Unlike run-hold-peers, URL is always used: the RPC head stream is the reference
+# clock, not just a genesis lookup. Setting GENESIS only skips the genesis fetch.
+GENESIS=${GENESIS:-}
+
+# Keep PEERS small. The point of this process is to stay idle enough to be a
+# trustworthy clock; use run-hold-peers to generate load.
+PEERS=${PEERS:-4}
+ROLE=${ROLE:-light}
+DURATION=${DURATION:-60}
+IDLE_TIMEOUT=${IDLE_TIMEOUT:-300}
+# Grace period for the probe peers to connect before measuring starts.
+CONNECT_TIMEOUT=${CONNECT_TIMEOUT:-30}
+
+export RUST_LOG=info
+
+GENESIS_ARG=""
+if [ -n "$GENESIS" ]; then
+    GENESIS_ARG="--genesis $GENESIS"
+fi
+
+# Build once: cargo build --release -p subp2p-explorer-cli
+./target/release/subp2p-explorer-cli probe-announces   --url $URL   $GENESIS_ARG   --address $ADDRESS   --role $ROLE --peers $PEERS --duration $DURATION --idle-timeout $IDLE_TIMEOUT --connect-timeout $CONNECT_TIMEOUT
