@@ -19,6 +19,7 @@ use commands::{
     light_spam::spam_light,
     probe_announces::probe_announces,
     soak_light::soak_light,
+    warp_sync::warp_sync,
 };
 use jsonrpsee::client_transport::ws::Url;
 use std::{error::Error, io::Read, path::PathBuf};
@@ -37,6 +38,7 @@ enum Command {
     SoakLight(SoakLightOpts),
     HoldPeers(HoldPeersOpts),
     ProbeAnnounces(ProbeAnnouncesOpts),
+    WarpSync(WarpSyncOpts),
 }
 
 /// Measure block-announcement quality from a small, unloaded process.
@@ -136,6 +138,67 @@ pub struct HoldPeersOpts {
     /// announcement). Created if missing.
     #[clap(long)]
     out_dir: Option<std::path::PathBuf>,
+}
+
+/// Impersonate warp-syncing clients against one full node, to load-test its
+/// GRANDPA warp-proof server (`/<genesis>/sync/warp`).
+///
+/// Each client keeps exactly one request in flight, as a real client does, so
+/// load scales with `--clients` rather than pipeline depth. The node's inbound
+/// warp queue is a hardcoded 20 with no CLI flag, so that is usually what binds
+/// first; past it requests are dropped silently, with nothing in the node log.
+/// Confirm shedding with
+/// `substrate_sub_libp2p_requests_in_failure_total{reason="busy-omitted"}`.
+///
+/// No proof decoding is involved: `begin` only has to be a finalized canonical
+/// block hash, so the walk uses block hashes fetched from RPC up front.
+#[derive(Debug, ClapParser)]
+pub struct WarpSyncOpts {
+    /// Chain preset (supplies a default p2p host and RPC url).
+    #[clap(long, short, value_enum)]
+    chain: Option<Chain>,
+    /// RPC endpoint (fetches genesis and the begin block hashes). Required
+    /// unless --chain, or unless --genesis and --begin are both given.
+    #[clap(long, short)]
+    url: Option<String>,
+    /// Multiaddress of the full node to dial. Required unless --chain.
+    #[clap(long, short)]
+    address: Option<String>,
+    /// Hex-encoded genesis hash. Fetched from the RPC if omitted.
+    #[clap(long, short)]
+    genesis: Option<String>,
+    /// Override the full warp protocol name (e.g. for chains with a fork id:
+    /// "/<genesis>/<fork_id>/sync/warp"). Defaults to "/<genesis>/sync/warp".
+    #[clap(long, short)]
+    protocol: Option<String>,
+    /// Pin one hex-encoded begin block hash for every request, skipping the RPC
+    /// walk entirely. Must be finalized and on the canonical chain.
+    #[clap(long)]
+    begin: Option<String>,
+    /// Block number the walk starts from. 0 (genesis) makes the node rebuild the
+    /// whole authority-set history per request — the heaviest case.
+    #[clap(long, default_value = "0")]
+    begin_block: u64,
+    /// Blocks to advance `begin` per request. 0 re-sends the same begin every
+    /// time; a non-zero step walks forward like a real client, approximately
+    /// (steps need not land on authority-set-change blocks).
+    #[clap(long, default_value = "0")]
+    step: u64,
+    /// Number of concurrent fake warp-syncing clients, each a distinct PeerId.
+    #[clap(long, short = 'C', default_value = "8")]
+    clients: usize,
+    /// Warp requests each client sends, one at a time.
+    #[clap(long, short = 'r', default_value = "10")]
+    requests: usize,
+    /// Delay in milliseconds between opening successive clients. 0 = all at once.
+    #[clap(long, default_value = "0")]
+    stagger_ms: u64,
+    /// Per-request timeout in seconds (the saturation signal).
+    #[clap(long, default_value = "20", value_parser = parse_duration)]
+    request_timeout: std::time::Duration,
+    /// Overall wall-clock timeout in seconds for the whole run.
+    #[clap(long, short, default_value = "300", value_parser = parse_duration)]
+    timeout: std::time::Duration,
 }
 
 /// Spam the `/<genesis>/light/2` request-response protocol of an appointed full
@@ -621,6 +684,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 opts.duration,
                 opts.idle_timeout,
                 opts.connect_timeout,
+            )
+            .await
+        }
+        Command::WarpSync(opts) => {
+            warp_sync(
+                opts.chain,
+                opts.url,
+                opts.address,
+                opts.genesis,
+                opts.protocol,
+                opts.begin,
+                opts.begin_block,
+                opts.step,
+                opts.clients,
+                opts.requests,
+                opts.stagger_ms,
+                opts.request_timeout,
+                opts.timeout,
             )
             .await
         }

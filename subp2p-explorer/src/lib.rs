@@ -10,6 +10,7 @@ pub mod notifications;
 pub mod peer_behavior;
 pub mod transport;
 pub mod util;
+pub mod warp;
 
 /// Network behavior for subtrate based chains.
 #[derive(NetworkBehaviour)]
