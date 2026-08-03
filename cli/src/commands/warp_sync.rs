@@ -14,12 +14,28 @@
 //!
 //! That queue is the thing worth measuring: `MAX_WARP_REQUEST_QUEUE` is a
 //! hardcoded 20 (`sync/src/warp_request_handler.rs:38`) with no CLI flag, an
-//! order of magnitude below `--light-client-request-queue-size`. Past it,
-//! `request_responses.rs` drops the request *silently* — `let _ =
-//! resp_builder.try_send(..)` — so the node logs nothing. Client-side it looks
-//! like a closed substream with no body. Watch
-//! `substrate_sub_libp2p_requests_in_failure_total{reason="busy-omitted"}` on the
-//! node's Prometheus endpoint to confirm shedding.
+//! order of magnitude below `--light-client-request-queue-size`. Past it the
+//! request is dropped, and client-side that is indistinguishable from a rejected
+//! `begin`: both are a closed substream with no body.
+//!
+//! Tell them apart with `substrate_sub_libp2p_requests_in_failure_total`, whose
+//! `reason` label differs per network backend:
+//!
+//! | cause | litep2p | libp2p |
+//! |---|---|---|
+//! | inbound queue full | `sending into a full channel` | `busy-omitted` |
+//! | handler refused (bad `begin`) | `rejected` | (no response recorded) |
+//!
+//! litep2p passes the `try_send` error's `Display` straight through as the label
+//! (`litep2p/shim/request_response/mod.rs:330`), which is where that long
+//! `async_channel` string comes from; libp2p maps `InboundFailure::ResponseOmission`
+//! to `busy-omitted` (`service.rs:1533`).
+//!
+//! Do **not** use `requests_in_success_total` as a serve-time measure on litep2p:
+//! its `started` instant is captured *after* the response future resolves
+//! (`mod.rs:318-320`), so it times only handing the response to the transport —
+//! microseconds — and excludes proof generation entirely. The libp2p backend
+//! stamps arrival time instead and does include it.
 //!
 //! No response decoding is needed. `begin` only has to be a finalized canonical
 //! block hash (`grandpa/src/warp_proof.rs:95-115`), so we walk the chain with
@@ -434,10 +450,11 @@ fn print_report(
             println!("  {count:>6}  {reason}");
         }
         println!(
-            "  note: a closed substream with no proof is either a queue-full drop \
-             (the node logs nothing) or a rejected begin. Separate them with\n        \
-             substrate_sub_libp2p_requests_in_failure_total{{reason=\"busy-omitted\"}} \
-             on the node's Prometheus endpoint."
+            "  note: a closed substream with no proof is either a queue-full drop or a\n        \
+             rejected begin. Separate them on the node's Prometheus endpoint with\n        \
+             substrate_sub_libp2p_requests_in_failure_total{{reason=...}}:\n          \
+             litep2p: \"sending into a full channel\" = shed, \"rejected\" = bad begin\n          \
+             libp2p:  \"busy-omitted\" = shed"
         );
     }
 }

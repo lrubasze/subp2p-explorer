@@ -146,9 +146,11 @@ pub struct HoldPeersOpts {
 /// Each client keeps exactly one request in flight, as a real client does, so
 /// load scales with `--clients` rather than pipeline depth. The node's inbound
 /// warp queue is a hardcoded 20 with no CLI flag, so that is usually what binds
-/// first; past it requests are dropped silently, with nothing in the node log.
-/// Confirm shedding with
-/// `substrate_sub_libp2p_requests_in_failure_total{reason="busy-omitted"}`.
+/// first. Past it requests are dropped, which client-side is indistinguishable
+/// from a rejected `begin`. Separate them with
+/// `substrate_sub_libp2p_requests_in_failure_total`: on litep2p the reason label
+/// is "sending into a full channel" for a shed request and "rejected" for a bad
+/// begin; on libp2p a shed request is "busy-omitted".
 ///
 /// No proof decoding is involved: `begin` only has to be a finalized canonical
 /// block hash, so the walk uses block hashes fetched from RPC up front.
