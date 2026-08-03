@@ -21,5 +21,5 @@ CONNECTIONS=${CONNECTIONS:-1}
 export RUST_LOG=info
 
 # Build once: cargo build --release -p subp2p-explorer-cli
-./target/release/subp2p-explorer-cli spam-light   --url $URL   --address $ADDRESS  --method $METHOD   --count $COUNT --concurrency $CONCURRENCY --connections $CONNECTIONS
+./target/release/subp2p-explorer-cli spam-light   --url $URL   --address $ADDRESS  --method $METHOD   --count $COUNT --concurrency $CONCURRENCY --connections $CONNECTIONS --timeout $DURATION
 
