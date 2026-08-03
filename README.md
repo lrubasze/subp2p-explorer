@@ -6,6 +6,22 @@ Substrate based chains p2p network explorer.
 
 Take a look at the examples provided in the [commands](./cli/src/commands/) folder to learn more about the p2p interface.
 
+## Node load testing
+
+Beyond exploring the network, the CLI can load-test a single full node. The two
+halves measure independent limits and have their own docs:
+
+- **Request serving** — [`examples.md`](./examples.md) for `spam-light` /
+  `soak-light` usage, and
+  [`light-request-capacity-test-plan.md`](./light-request-capacity-test-plan.md)
+  for the methodology and measured results. These hammer the `/light/2`
+  request-response handler.
+- **Peer capacity and announcement quality** —
+  [`peer-capacity-examples.md`](./peer-capacity-examples.md) for `hold-peers` /
+  `probe-announces`. These occupy the peer slots that `--in-peers-light` and
+  `--in-peers` ration, and measure how announcements degrade as the peer count
+  grows.
+
 ## discover-network
 
 This command crawls the p2p network. For more details see the [kad-dht spec](https://github.com/libp2p/specs/blob/master/kad-dht/README.md).
