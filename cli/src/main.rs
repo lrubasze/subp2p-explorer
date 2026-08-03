@@ -174,7 +174,9 @@ pub struct SpamLightOpts {
     protocol: Option<String>,
     /// Method mix to spam, comma-separated with optional ":weight". Names:
     /// account_nonce, can_store, account_authorization, indexed_transactions,
-    /// revive_get_storage; generic "call:<method>:<hexdata>" / "read:<hexkey>";
+    /// revive_get_storage; generic "call:<method>:<hexdata>" /
+    /// "read:<hexkey>[+<hexkey>…]" (keys joined with '+', since ',' separates
+    /// methods);
     /// or a bare runtime-API name (no args, e.g. Core_version). Defaults to the
     /// chain preset, else account_nonce.
     ///

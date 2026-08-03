@@ -332,6 +332,21 @@ pub(crate) fn parse_method(token: &str) -> Result<(String, MethodKind), Box<dyn 
             }
             MethodKind::ReviveDotns { entries }
         }
+        // A long even-length run of hex digits is a storage key someone separated
+        // with `,` instead of `+`, not a runtime API name (those always carry an
+        // `Api_method` shape). Catching it here keeps the old failure mode —
+        // a stray key quietly becoming a runtime call — from coming back.
+        _ if !token.contains(':')
+            && token.len() >= 16
+            && token.len() % 2 == 0
+            && token.chars().all(|c| c.is_ascii_hexdigit()) =>
+        {
+            return Err(format!(
+                "'{token}' looks like a hex storage key, not a runtime API name. \
+                 Multiple read keys are separated with '+': read:<key1>+<key2>"
+            )
+            .into())
+        }
         // Core_version etc: a no-arg runtime call, handy for connectivity checks.
         _ if !token.contains(':') => MethodKind::GenericCall {
             method: token.to_string(),
@@ -346,14 +361,25 @@ pub(crate) fn parse_method(token: &str) -> Result<(String, MethodKind), Box<dyn 
                 data: hex::decode(data_hex.trim_start_matches("0x"))?,
             }
         }
+        // read:<hexkey>[+<hexkey>...] — all keys go in one `RemoteReadRequest`.
+        //
+        // Keys are separated with `+`, not `,`, for the same reason
+        // `revive_dotns` uses `+`: `parse_method_spec` splits the whole spec on
+        // `,` before this function sees a token, so a comma here would detach
+        // every key after the first. Those stray keys used to fall through to
+        // the bare-runtime-API arm and silently become runtime calls named after
+        // the hex string.
         _ if token.starts_with("read:") => {
-            // read:<hexkey>[,<hexkey>...]
             let rest = &token["read:".len()..];
             let keys = rest
-                .split(',')
+                .split('+')
+                .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(|k| hex::decode(k.trim_start_matches("0x")))
                 .collect::<Result<Vec<_>, _>>()?;
+            if keys.is_empty() {
+                return Err("read: needs at least one hex storage key".into());
+            }
             MethodKind::GenericRead { keys }
         }
         other => return Err(format!("unknown method '{other}'").into()),
@@ -634,6 +660,42 @@ mod tests {
                 other => panic!("{token} should be a runtime call, got {other:?}"),
             }
         }
+    }
+
+    /// `read:` keys are separated with `+`. A `,` would be eaten by
+    /// `parse_method_spec`'s method splitter before `parse_method` ever saw the
+    /// token, detaching every key after the first.
+    #[test]
+    fn multi_key_reads_use_plus_and_stay_one_request() {
+        let (methods, schedule) =
+            parse_method_spec("read:aabb+0xccdd").expect("a two-key read parses");
+
+        assert_eq!(methods.len(), 1, "both keys belong to one request");
+        assert_eq!(schedule.len(), 1);
+        match &methods[0].1 {
+            // `0x` prefixes are optional and stripped per key.
+            MethodKind::GenericRead { keys } => {
+                assert_eq!(keys, &vec![vec![0xaa, 0xbb], vec![0xcc, 0xdd]]);
+            }
+            other => panic!("expected a storage read, got {other:?}"),
+        }
+    }
+
+    /// The old silent failure: a key separated with `,` got detached and became a
+    /// runtime call named after the hex. It must now be a hard error.
+    #[test]
+    fn a_stray_hex_key_is_rejected_not_called_as_a_runtime_api() {
+        let key = "26aa394eea5630e07c48ae0c9558cef7b99d880ec681799c0cf30e8886371da9";
+        let err = parse_method_spec(&format!("read:aabb,{key}"))
+            .expect_err("a comma-separated key must not parse");
+        assert!(
+            err.to_string().contains('+'),
+            "the error should point at the '+' separator, got: {err}"
+        );
+
+        // Real runtime API names are unaffected.
+        assert!(parse_method_spec("Core_version").is_ok());
+        assert!(parse_method_spec("Metadata_metadata").is_ok());
     }
 
     /// The presets are plain names, so they must still take a `:weight` suffix

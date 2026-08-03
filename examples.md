@@ -91,7 +91,10 @@ caches don't absorb the load.
 | `revive_get_storage` | Asset Hub | `ReviveApi_get_storage` | `H160` (20 B) ++ random key (32 B) = 52 B |
 | `revive_dotns:<dom>[+<dom>…]` | Asset Hub | `ReviveApi_get_storage` | reads the **real** `DOTNS_REGISTRY` owner slot of each domain: `H160` ++ `keccak256(namehash(domain) ++ uint256(0))`; derivation logged at startup. Domains separated by `+` (not `,`) |
 | `call:<method>:<hexdata>` | any | `<method>` | raw hex `data` |
-| `read:<hexkey>[,<hexkey>…]` | any | (`RemoteReadRequest`) | storage Merkle proof for the keys |
+| `read:<hexkey>[+<hexkey>…]` | any | (`RemoteReadRequest`) | storage Merkle proof for the keys, all in one request. Keys separated by `+` (not `,`) |
+| `warp_code` | any | (`RemoteReadRequest`) | `:code` ++ `:heappages` — the runtime download a warp-syncing smoldot performs. The heaviest single request here: the response carries the whole Wasm blob (~1.65 MiB on Kusama) |
+| `babe_configuration`, `babe_current_epoch`, `babe_next_epoch` | Babe chains | `BabeApi_*` | no args. The consensus calls smoldot makes right after the runtime download |
+| `aura_slot_duration`, `aura_authorities` | Aura chains | `AuraApi_*` | no args. The Aura equivalent (most parachains) |
 | `<BareName>` | any | `<BareName>` | no args (e.g. `Core_version`, `Metadata_metadata`) |
 
 > `revive` lives on **Asset Hub**, not Bulletin. `revive_get_storage` defaults to a
@@ -107,8 +110,8 @@ weight-expanded list (port of `call-load.js`):
 - `"can_store:3,account_nonce,indexed_transactions"` — weighted 3:1:1.
 - `"revive_get_storage,account_nonce"` — the Asset Hub preset default.
 
-Caveat: `revive_dotns` separates its **domains** with `+`, because `,` already
-separates methods — so
+Caveat: `revive_dotns` separates its **domains** with `+`, and `read:` separates
+its **keys** with `+`, because `,` already separates methods — so
 `"revive_dotns:playground.dot+hello.dot,account_nonce"` is two methods
 (a dotNS reader over two domains, plus `account_nonce`). Weights aren't applied to
 `revive_dotns` / `call:` / `read:` tokens (they carry their own punctuation);
@@ -205,6 +208,12 @@ cargo run -p subp2p-explorer-cli -- spam-light \
 cargo run -p subp2p-explorer-cli -- spam-light \
   --chain paseo-next-bulletin \
   --method "read:26aa394eea5630e07c48ae0c9558cef7b99d880ec681799c0cf30e8886371da9"
+
+# The /light/2 half of a smoldot warp sync: runtime download + consensus calls.
+# warp_code alone returns ~1.65 MiB, far more than any other method here.
+cargo run -p subp2p-explorer-cli -- spam-light \
+  --chain paseo-next-bulletin \
+  --method "warp_code,aura_slot_duration,aura_authorities"
 ```
 
 ---
