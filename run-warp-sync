@@ -1,0 +1,143 @@
+#!/bin/bash
+
+# Impersonate warp-syncing clients against one node, to load-test its GRANDPA
+# warp-proof server (/<genesis>/sync/warp).
+#
+# Shape of this test: each client keeps ONE request in flight, like a real
+# client, so load scales with CLIENTS rather than with pipeline depth. The node's
+# inbound warp queue is a hardcoded 20 (MAX_WARP_REQUEST_QUEUE, no CLI flag,
+# an order of magnitude below --light-client-request-queue-size), so CLIENTS
+# above ~20 is where shedding starts. That is the interesting region.
+#
+# MIND THE BANDWIDTH. Every request starting from genesis returns a full 8 MiB
+# proof — measured against the Kusama node: 8,373,366 bytes, 398 fragments,
+# is_finished=false, i.e. capped 15 kB short of MAX_WARP_SYNC_PROOF_SIZE. Total
+# egress is roughly CLIENTS x REQUESTS x 8 MiB, so the defaults here are
+# deliberately small (8 x 5 x 8 MiB ~= 320 MiB). Scale up on purpose, not by
+# accident.
+#
+# Shedding is NOT visible in the client output alone: a shed request and a
+# refused `begin` both arrive as a closed substream with no proof. Only the
+# node's Prometheus counters separate them, so this script snapshots them either
+# side of the run when OUT_DIR is set:
+#
+#   litep2p:  reason="sending into a full channel"  = shed (queue was full)
+#             reason="rejected"                     = begin refused by the handler
+#   libp2p:   reason="busy-omitted"                 = shed
+#
+# Do not read requests_in_success_total as serve time on litep2p: it is stamped
+# after the response future resolves, so it times only handing the response to
+# the transport (measured 11us against a 112-276ms client-side latency) and
+# excludes proof generation entirely.
+
+#URL=ws://127.0.0.1:9944
+#ADDRESS=/ip4/127.0.0.1/tcp/30333
+
+URL=wss://kusama-rpc.polkadot.io
+ADDRESS=/ip4/195.154.218.123/tcp/30333
+
+#URL=wss://paseo-asset-hub-next-rpc.polkadot.io
+#ADDRESS=/dns4/paseo-asset-hub-next-collator-node-0.parity-testnet.parity.io/tcp/443/wss
+
+# Set GENESIS to skip the RPC entirely. Only possible with STEP=0, since a
+# non-zero STEP resolves its begin hashes over RPC. Kusama:
+# b0a8d493285c2df73290dfb7e61f870f17b41801197a149ca93654499ea3dafe
+GENESIS=${GENESIS:-}
+
+# Concurrent fake clients, each a distinct PeerId, each 1 request in flight.
+# Cross the node's queue of 20 to look for shedding.
+CLIENTS=${CLIENTS:-8}
+# Warp requests per client, sent one after another.
+REQUESTS=${REQUESTS:-5}
+# Block number the walk starts from. 0 = genesis, which makes the node rebuild
+# the whole authority-set history per request: the heaviest case.
+BEGIN_BLOCK=${BEGIN_BLOCK:-0}
+# Blocks to advance `begin` per request. 0 re-sends the same begin every time,
+# which is the sharpest capacity probe. A non-zero step walks forward like a real
+# client, approximately — steps need not land on authority-set-change blocks.
+# Measured on Kusama: even from block 15,000,000 a response still caps at 8 MiB
+# with is_finished=false, so the walk does not get cheap any time soon.
+STEP=${STEP:-0}
+# Gap between opening clients, in milliseconds. 0 opens them all at once, which
+# is what you want when probing the queue.
+STAGGER_MS=${STAGGER_MS:-0}
+# Per-request timeout. 8 MiB over a slow link takes a while; keep this generous
+# or transfers get counted as saturation.
+REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-20}
+# Overall wall-clock cap for the run.
+TIMEOUT=${TIMEOUT:-300}
+
+# Where the node lives, for the Prometheus counter snapshots. Passed through to
+# run-monitor-node as well.
+HOST=${HOST:-dev-machine2}
+PROM_PORT=${PROM_PORT:-9615}
+
+# Set OUT_DIR to capture one comparable dataset per run, e.g.
+#
+#   OUT_DIR=results/warp-25 CLIENTS=25 ./run-warp-sync
+#
+# It collects node.csv (run-monitor-node, started here and stopped when the run
+# ends), warp-counters-before.txt / warp-counters-after.txt (the node's
+# request-response counters for this protocol, which is where shedding shows up),
+# meta.txt (the run parameters) and warp.log (this console output).
+# run-monitor-node's HOST / INTERVAL variables pass through. Unset, the run just
+# prints to the terminal.
+OUT_DIR=${OUT_DIR:-}
+
+export RUST_LOG=info
+
+if [ -n "$GENESIS" ]; then
+    if [ "$STEP" != "0" ]; then
+        echo "GENESIS skips the RPC, but STEP=$STEP needs it to resolve begin hashes." >&2
+        echo "Either unset GENESIS or set STEP=0." >&2
+        exit 1
+    fi
+    CHAIN_SOURCE="--genesis $GENESIS"
+else
+    CHAIN_SOURCE="--url $URL"
+fi
+
+# The node's warp counters. The failure family is absent until something fails,
+# so an empty section in these files means "nothing shed, nothing refused".
+warp_counters() {
+    ssh "$HOST" "curl -s http://127.0.0.1:$PROM_PORT/metrics \
+        | grep -E '^substrate_sub_libp2p_requests_(in|out)_(success|failure)_total' \
+        | grep 'sync/warp' | grep -v _bucket" 2>/dev/null
+}
+
+# Build once: cargo build --release -p subp2p-explorer-cli
+CMD=(./target/release/subp2p-explorer-cli warp-sync $CHAIN_SOURCE --address $ADDRESS
+    --clients $CLIENTS --requests $REQUESTS --begin-block $BEGIN_BLOCK --step $STEP
+    --stagger-ms $STAGGER_MS --request-timeout $REQUEST_TIMEOUT --timeout $TIMEOUT)
+
+echo "warp-sync: $CLIENTS client(s) x $REQUESTS request(s) => ~$((CLIENTS * REQUESTS * 8)) MiB of proof"
+if [ "$CLIENTS" -gt 20 ]; then
+    echo "  CLIENTS=$CLIENTS is above the node's queue of 20: expect shedding in the counters"
+fi
+
+if [ -z "$OUT_DIR" ]; then
+    exec "${CMD[@]}"
+fi
+
+mkdir -p "$OUT_DIR"
+{
+    echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "address=$ADDRESS"
+    echo "clients=$CLIENTS requests=$REQUESTS begin_block=$BEGIN_BLOCK step=$STEP"
+    echo "stagger_ms=$STAGGER_MS request_timeout=$REQUEST_TIMEOUT timeout=$TIMEOUT"
+} > "$OUT_DIR/meta.txt"
+
+warp_counters > "$OUT_DIR/warp-counters-before.txt"
+
+OUT_DIR="$OUT_DIR" ./run-monitor-node &
+MONITOR_PID=$!
+trap 'kill $MONITOR_PID 2>/dev/null' EXIT
+
+"${CMD[@]}" 2>&1 | tee "$OUT_DIR/warp.log"
+
+warp_counters > "$OUT_DIR/warp-counters-after.txt"
+
+echo
+echo "counter delta (before -> after):"
+diff "$OUT_DIR/warp-counters-before.txt" "$OUT_DIR/warp-counters-after.txt" \
+    | grep -E '^[<>]' || echo "  (no change)"
