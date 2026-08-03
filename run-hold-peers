@@ -40,6 +40,16 @@ RAMP_MS=${RAMP_MS:-10}
 # timeout (measured: 10.0s against a dev node) regardless of this value.
 IDLE_TIMEOUT=${IDLE_TIMEOUT:-300}
 
+# Set OUT_DIR to capture one comparable dataset per run, e.g.
+#
+#   OUT_DIR=results/light-500 PEERS=500 ./run-hold-peers
+#
+# It collects hold-samples.csv + hold-blocks.csv (written by the CLI), node.csv
+# (run-monitor-node, started here and stopped when the run ends), meta.txt (the
+# run parameters) and hold.log (this console output). run-monitor-node's HOST /
+# INTERVAL variables pass through. Unset, the run behaves as before.
+OUT_DIR=${OUT_DIR:-}
+
 export RUST_LOG=info
 
 if [ -n "$GENESIS" ]; then
@@ -49,4 +59,22 @@ else
 fi
 
 # Build once: cargo build --release -p subp2p-explorer-cli
-./target/release/subp2p-explorer-cli hold-peers   $CHAIN_SOURCE   --address $ADDRESS   --role $ROLE --peers $PEERS --ramp-ms $RAMP_MS --duration $DURATION --idle-timeout $IDLE_TIMEOUT
+CMD=(./target/release/subp2p-explorer-cli hold-peers $CHAIN_SOURCE --address $ADDRESS
+    --role $ROLE --peers $PEERS --ramp-ms $RAMP_MS --duration $DURATION --idle-timeout $IDLE_TIMEOUT)
+
+if [ -z "$OUT_DIR" ]; then
+    exec "${CMD[@]}"
+fi
+
+mkdir -p "$OUT_DIR"
+{
+    echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "address=$ADDRESS"
+    echo "role=$ROLE peers=$PEERS duration=$DURATION ramp_ms=$RAMP_MS idle_timeout=$IDLE_TIMEOUT"
+} > "$OUT_DIR/meta.txt"
+
+OUT_DIR="$OUT_DIR" ./run-monitor-node &
+MONITOR_PID=$!
+trap 'kill $MONITOR_PID 2>/dev/null' EXIT
+
+"${CMD[@]}" --out-dir "$OUT_DIR" 2>&1 | tee "$OUT_DIR/hold.log"

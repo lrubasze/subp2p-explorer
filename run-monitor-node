@@ -1,0 +1,77 @@
+#!/bin/bash
+
+# Sample the node under test into a CSV, for plotting alongside hold-peers data.
+#
+# One ssh session streams samples back, one row per INTERVAL seconds:
+#
+#   epoch_ms,cpu_pct,rss_kb,fds,conns,peers_count,best,finalized
+#
+# - cpu_pct/rss_kb/fds come from /proc of the polkadot process (cpu_pct is
+#   percent of one core over the sampling interval, so it can exceed 100)
+# - conns is established TCP on the p2p port, the kernel's view — a refused
+#   peer is still connected for ~10s, so this sits above peers_count
+# - peers_count/best/finalized come from the node's Prometheus endpoint;
+#   best/finalized advancing under load is the "node still does its job" signal
+#
+# Rows are stamped with the REMOTE clock, same as the node's own view; the local
+# offset is printed at start so series from both machines can be aligned.
+#
+# Runs until the node exits or this script is killed. Usually started by
+# run-hold-peers (OUT_DIR set), but works standalone:
+#
+#   OUT_DIR=results/manual ./run-monitor-node
+
+HOST=${HOST:-dev-machine2}
+INTERVAL=${INTERVAL:-5}
+P2P_PORT=${P2P_PORT:-30333}
+PROM_PORT=${PROM_PORT:-9615}
+OUT_DIR=${OUT_DIR:-.}
+
+mkdir -p "$OUT_DIR"
+OUT="$OUT_DIR/node.csv"
+
+SKEW=$(( $(date +%s) - $(ssh "$HOST" date +%s) ))
+echo "monitoring polkadot on $HOST -> $OUT (every ${INTERVAL}s, local-remote clock skew ${SKEW}s)"
+
+# exec so that killing this script's pid kills the ssh session (and with it the
+# remote sampling loop, which dies on the broken pipe at its next write).
+exec ssh "$HOST" "INTERVAL=$INTERVAL P2P_PORT=$P2P_PORT PROM_PORT=$PROM_PORT bash -s" > "$OUT" <<'EOF'
+PID=$(pgrep -x polkadot | head -1)
+if [ -z "$PID" ]; then
+    echo "polkadot is not running" >&2
+    exit 1
+fi
+CLK=$(getconf CLK_TCK)
+
+echo "epoch_ms,cpu_pct,rss_kb,fds,conns,peers_count,best,finalized"
+
+prev_cpu=0
+prev_ms=0
+while kill -0 "$PID" 2>/dev/null; do
+    now_ms=$(date +%s%3N)
+
+    # utime+stime are fields 14+15 of /proc/pid/stat; the comm field (2) never
+    # contains spaces for polkadot, so plain word splitting is safe.
+    read -r -a stat < "/proc/$PID/stat"
+    cur_cpu=$(( stat[13] + stat[14] ))
+    cpu=""
+    if [ "$prev_ms" -gt 0 ]; then
+        cpu=$(awk -v d=$((cur_cpu - prev_cpu)) -v clk="$CLK" -v ms=$((now_ms - prev_ms)) \
+            'BEGIN { printf "%.1f", 100000 * d / clk / ms }')
+    fi
+    prev_cpu=$cur_cpu
+    prev_ms=$now_ms
+
+    rss=$(awk '/VmRSS/ { print $2 }' "/proc/$PID/status")
+    fds=$(ls "/proc/$PID/fd" 2>/dev/null | wc -l)
+    conns=$(ss -tnH state established "( sport = :$P2P_PORT )" | wc -l)
+
+    prom=$(curl -s --max-time 2 "localhost:$PROM_PORT/metrics")
+    peers=$(echo "$prom" | awk '$1 ~ /^substrate_sub_libp2p_peers_count/ { print $2 }')
+    best=$(echo "$prom" | awk '$1 ~ /^substrate_block_height{status="best"/ { print $2 }')
+    finalized=$(echo "$prom" | awk '$1 ~ /^substrate_block_height{status="finalized"/ { print $2 }')
+
+    echo "$now_ms,$cpu,$rss,$fds,$conns,$peers,$best,$finalized"
+    sleep "$INTERVAL"
+done
+EOF

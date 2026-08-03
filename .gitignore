@@ -10,3 +10,6 @@ cache/
 
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
+
+# per-run measurement data
+results/
