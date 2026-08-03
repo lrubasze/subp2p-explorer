@@ -189,6 +189,16 @@ pub(crate) fn random_account() -> Vec<u8> {
     a.to_vec()
 }
 
+/// A `RemoteCallRequest` for a runtime API that takes no arguments. Every call
+/// in smoldot's warp-sync set is of this shape (`RuntimeCall::parameter_vectored`
+/// returns an empty iterator in `smoldot/lib/src/chain/chain_information/build.rs`).
+fn no_arg_call(method: &str) -> MethodKind {
+    MethodKind::GenericCall {
+        method: method.to_string(),
+        data: Vec::new(),
+    }
+}
+
 impl MethodKind {
     /// Build the prost-encoded `/light/2` request for this method, executing at
     /// block `head_hash` (raw 32 bytes), with `head_num` available as the
@@ -256,6 +266,42 @@ pub(crate) fn parse_method(token: &str) -> Result<(String, MethodKind), Box<dyn 
                 .map_err(|_| "revive default address is not 20 bytes")?;
             MethodKind::ReviveGetStorage { address }
         }
+
+        // --- smoldot warp-sync tail ---------------------------------------
+        // Steps 3 and 4 of smoldot's warp sync are the *only* `/light/2` traffic
+        // a warp-syncing light client generates; there is no `/state/2` and no
+        // body download (`light-base` sets `download_bodies: false`). See
+        // `smoldot/lib/src/sync/warp_sync.rs` (module docs, and
+        // `runtime_calls_default_value` for the per-consensus call set).
+        //
+        // These are named presets purely for discoverability and honest labels
+        // in the per-method stats — each one is reachable through the generic
+        // `read:` / bare-runtime-API forms too.
+
+        // Step 3, the runtime download, and by far the heaviest single request
+        // in a warp sync: the response carries the entire runtime blob. Measured
+        // on Kusama, `:code` is 1,724,612 bytes and its read proof is 1,725,384
+        // — i.e. 772 bytes of surrounding trie nodes, the rest is the Wasm.
+        // Both keys go in one request, as smoldot sends them (`warp_sync.rs`,
+        // `keys: vec![code_key_to_request, b":heappages"]`).
+        "warp_code" => MethodKind::GenericRead {
+            keys: vec![b":code".to_vec(), b":heappages".to_vec()],
+        },
+
+        // Step 4, the consensus parameters. Small on the wire — the proof holds
+        // only the storage items the call touched, *not* `:code`, which the node
+        // resolves off the unwrapped trie backend before the recorder is built
+        // (`polkadot-sdk/substrate/client/service/src/client/call_executor.rs`,
+        // `prove_execution`). The cost is CPU: each one is a real Wasm
+        // instantiation + call in the node's proving backend.
+        "babe_configuration" => no_arg_call("BabeApi_configuration"),
+        "babe_current_epoch" => no_arg_call("BabeApi_current_epoch"),
+        "babe_next_epoch" => no_arg_call("BabeApi_next_epoch"),
+        // Aura chains (most parachains, incl. the Asset Hub / Bulletin / People
+        // presets above) take this pair instead of the three Babe calls.
+        "aura_slot_duration" => no_arg_call("AuraApi_slot_duration"),
+        "aura_authorities" => no_arg_call("AuraApi_authorities"),
+
         // revive_dotns:<domain>[+<domain>…] — read the real REGISTRY_RECORDS
         // (owner) slot for each domain off DOTNS_REGISTRY.
         _ if token.starts_with("revive_dotns:") => {
@@ -550,4 +596,58 @@ pub(crate) async fn build_swarm(
         .build();
 
     Ok(swarm)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The runtime-API names and storage keys are copied from smoldot; a typo
+    /// here would surface only as an opaque node-side error at run time, so pin
+    /// them. Sources: `smoldot/lib/src/chain/chain_information/build.rs`
+    /// (`RuntimeCall::function_name`) and `smoldot/lib/src/sync/warp_sync.rs`.
+    #[test]
+    fn warp_sync_presets_have_the_right_shape() {
+        let (_, kind) = parse_method("warp_code").expect("warp_code parses");
+        match kind {
+            MethodKind::GenericRead { keys } => {
+                // Both keys in one request, in smoldot's order.
+                assert_eq!(keys, vec![b":code".to_vec(), b":heappages".to_vec()]);
+            }
+            other => panic!("warp_code should be a storage read, got {other:?}"),
+        }
+
+        for (token, expected) in [
+            ("babe_configuration", "BabeApi_configuration"),
+            ("babe_current_epoch", "BabeApi_current_epoch"),
+            ("babe_next_epoch", "BabeApi_next_epoch"),
+            ("aura_slot_duration", "AuraApi_slot_duration"),
+            ("aura_authorities", "AuraApi_authorities"),
+        ] {
+            let (label, kind) = parse_method(token).expect("preset parses");
+            assert_eq!(label, token, "the stats label is the token as typed");
+            match kind {
+                MethodKind::GenericCall { method, data } => {
+                    assert_eq!(method, expected);
+                    assert!(data.is_empty(), "{token} takes no arguments");
+                }
+                other => panic!("{token} should be a runtime call, got {other:?}"),
+            }
+        }
+    }
+
+    /// The presets are plain names, so they must still take a `:weight` suffix
+    /// and compose with the rest of a mix.
+    #[test]
+    fn warp_sync_presets_compose_into_a_weighted_mix() {
+        let (methods, schedule) =
+            parse_method_spec("warp_code,babe_configuration:3,babe_current_epoch,babe_next_epoch")
+                .expect("the Babe warp-sync tail parses as a mix");
+
+        assert_eq!(methods.len(), 4);
+        // 1 + 3 + 1 + 1 — the weight expands in place.
+        assert_eq!(schedule.len(), 6);
+        assert_eq!(methods[0].0, "warp_code");
+        assert_eq!(methods[1].0, "babe_configuration");
+    }
 }

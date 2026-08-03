@@ -177,6 +177,14 @@ pub struct SpamLightOpts {
     /// revive_get_storage; generic "call:<method>:<hexdata>" / "read:<hexkey>";
     /// or a bare runtime-API name (no args, e.g. Core_version). Defaults to the
     /// chain preset, else account_nonce.
+    ///
+    /// The `/light/2` half of a smoldot warp sync is also available as presets:
+    /// warp_code (the runtime download — one request, ~1.65 MiB of response on
+    /// Kusama), plus the consensus calls babe_configuration, babe_current_epoch,
+    /// babe_next_epoch (Babe chains) or aura_slot_duration, aura_authorities
+    /// (Aura chains, i.e. most parachains). A whole warp-sync tail for a Babe
+    /// chain is
+    /// "warp_code,babe_configuration,babe_current_epoch,babe_next_epoch".
     #[clap(long, short)]
     method: Option<String>,
     /// Total number of requests to issue.
