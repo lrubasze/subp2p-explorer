@@ -1,0 +1,51 @@
+#!/bin/bash
+
+# Show which of the node's async tasks are close to saturation.
+#
+#   ./run-task-busy                 # 30s sample of whatever the node is doing now
+#   WINDOW=60 ./run-task-busy       # longer sample
+#
+# Run it while a load test is in flight; run it again with the node idle to get
+# the baseline. It is a diagnostic, not part of a measurement run, so it writes
+# nothing — read the numbers off the screen.
+#
+# busy% is poll time / wall time for one task, from substrate's own
+# `substrate_tasks_polling_duration` histogram, sampled twice and differenced.
+#
+# Why this and not CPU: a substrate task is a single async task. It can only run
+# on one thread at a time, so 100% busy means fully serialized regardless of how
+# many cores are free — and because the task migrates between tokio workers, its
+# cost is spread thin across threads and `top -H` shows nothing. Measured against
+# this node with 5000 held light peers: `libp2p-node` (the litep2p event loop)
+# 65% busy while no thread exceeded 11% of a core and the box had 16 of them.
+
+HOST=${HOST:-dev-machine2}
+PROM_PORT=${PROM_PORT:-9615}
+WINDOW=${WINDOW:-30}
+TOP=${TOP:-8}
+
+ssh "$HOST" "PROM_PORT=$PROM_PORT WINDOW=$WINDOW TOP=$TOP bash -s" <<'EOF'
+snap() {
+    curl -s --max-time 5 "localhost:$PROM_PORT/metrics" | awk '
+        /^substrate_tasks_polling_duration_(sum|count)/ {
+            split($0, a, "task_name=\""); split(a[2], b, "\"")
+            agg[b[1] "_" (($1 ~ /_sum/) ? "s" : "c")] += $2
+        }
+        END { for (k in agg) print k, agg[k] }'
+}
+
+before=$(snap); t0=$(date +%s.%N)
+sleep "$WINDOW"
+after=$(snap); t1=$(date +%s.%N)
+dt=$(awk -v x="$t0" -v y="$t1" 'BEGIN { print y - x }')
+
+echo "task busy over ${dt}s (poll time / wall time; one task cannot exceed 100%)"
+join <(echo "$before" | sort) <(echo "$after" | sort) | awk -v dt="$dt" '
+    { d[$1] = $3 - $2 }
+    END {
+        for (k in d) if (k ~ /_s$/) {
+            n = substr(k, 1, length(k) - 2)
+            if (d[n "_s"] > 0) printf "%6.1f%% busy  %9d polls  %s\n", 100 * d[n "_s"] / dt, d[n "_c"], n
+        }
+    }' | sort -rn | head -"$TOP"
+EOF

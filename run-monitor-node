@@ -4,7 +4,7 @@
 #
 # One ssh session streams samples back, one row per INTERVAL seconds:
 #
-#   epoch_ms,cpu_pct,rss_kb,fds,conns,peers_count,best,finalized
+#   epoch_ms,cpu_pct,rss_kb,fds,conns,peers_count,best,finalized,sync_target
 #
 # - cpu_pct/rss_kb/fds come from /proc of the polkadot process (cpu_pct is
 #   percent of one core over the sampling interval, so it can exceed 100)
@@ -12,6 +12,9 @@
 #   peer is still connected for ~10s, so this sits above peers_count
 # - peers_count/best/finalized come from the node's Prometheus endpoint;
 #   best/finalized advancing under load is the "node still does its job" signal
+# - sync_target is the highest block the node knows its peers have. If best
+#   stalls while sync_target keeps climbing, the node heard about new blocks and
+#   failed to import them; if both stall, it never heard about them at all.
 #
 # Rows are stamped with the REMOTE clock, same as the node's own view; the local
 # offset is printed at start so series from both machines can be aligned.
@@ -43,7 +46,7 @@ if [ -z "$PID" ]; then
 fi
 CLK=$(getconf CLK_TCK)
 
-echo "epoch_ms,cpu_pct,rss_kb,fds,conns,peers_count,best,finalized"
+echo "epoch_ms,cpu_pct,rss_kb,fds,conns,peers_count,best,finalized,sync_target"
 
 prev_cpu=0
 prev_ms=0
@@ -70,8 +73,9 @@ while kill -0 "$PID" 2>/dev/null; do
     peers=$(echo "$prom" | awk '$1 ~ /^substrate_sub_libp2p_peers_count/ { print $2 }')
     best=$(echo "$prom" | awk '$1 ~ /^substrate_block_height{status="best"/ { print $2 }')
     finalized=$(echo "$prom" | awk '$1 ~ /^substrate_block_height{status="finalized"/ { print $2 }')
+    target=$(echo "$prom" | awk '$1 ~ /^substrate_block_height{status="sync_target"/ { print $2 }')
 
-    echo "$now_ms,$cpu,$rss,$fds,$conns,$peers,$best,$finalized"
+    echo "$now_ms,$cpu,$rss,$fds,$conns,$peers,$best,$finalized,$target"
     sleep "$INTERVAL"
 done
 EOF
