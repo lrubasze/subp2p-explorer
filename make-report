@@ -1,0 +1,80 @@
+#!/bin/bash
+
+# Build a single self-contained HTML report out of the run directories.
+#
+#   ./make-report                     # reads results/, writes results/report.html
+#   RESULTS=other-dir ./make-report
+#
+# Open the output straight from disk — the data is inlined, so it needs no server
+# and no network. Re-run it after adding runs; it simply rebuilds from whatever
+# `results/light-*` directories exist. Runs still in flight are skipped.
+#
+# Lag is the metric the report is built around: how much the node's distance
+# behind the chain tip GREW during a run. Absolute lag needs a chain-time anchor
+# and drifts; the growth within one run cancels that. The anchor below is verified
+# on-chain (Timestamp pallet): block 34652020 was authored at 1785756960000, and
+# Kusama produces every 6.0s.
+
+set -u
+
+RESULTS=${RESULTS:-results}
+TEMPLATE=${TEMPLATE:-report-template.html}
+OUT=${OUT:-$RESULTS/report.html}
+
+ANCHOR_BLOCK=34652020
+ANCHOR_MS=1785756960
+BLOCK_SECS=6
+
+[ -f "$TEMPLATE" ] || { echo "missing template: $TEMPLATE" >&2; exit 1; }
+[ -d "$RESULTS" ] || { echo "no results directory: $RESULTS" >&2; exit 1; }
+
+# Per-run summary: one object per completed run.
+runs=$(
+    for d in $(ls -d "$RESULTS"/light-* 2>/dev/null | sort -t- -k2 -n); do
+        [ -f "$d/node.csv" ] || continue
+        # No summary line means the run never finished; skip rather than emit blanks.
+        grep -q "^spread ms:" "$d/hold.log" 2>/dev/null || continue
+
+        peers=$(grep -oP 'peers=\K[0-9]+' "$d/meta.txt")
+        held=$(grep -oP '^held:       peak \K[0-9]+' "$d/hold.log")
+        cov=$(grep -oP '^coverage:   mean \K[0-9.]+' "$d/hold.log")
+        read -r p50 mx < <(grep -oP '^spread ms:  p50=\K[0-9.]+|max=\K[0-9.]+' "$d/hold.log" | tr '\n' ' ')
+
+        awk -F, -v name="$(basename "$d" | sed 's/^light-/light-/')" -v peers="$peers" \
+            -v held="$held" -v cov="$cov" -v p50="$p50" -v mx="$mx" \
+            -v ab="$ANCHOR_BLOCK" -v am="$ANCHOR_MS" -v bs="$BLOCK_SECS" '
+            NR>2 { t=$1/1000; lag=(ab+(t-am)/bs-$7)*bs
+                   if (n==0) first=lag; last=lag; n++
+                   cpu+=$2; if ($3>rss) rss=$3 }
+            END { if (n>0) printf "{\"run\":\"%s\",\"peers\":%s,\"lag\":%.1f,\"spread50\":%s,\"spreadMax\":%s,\"coverage\":%s,\"held\":%s,\"cpu\":%.1f,\"rss\":%.0f}\n",
+                    name, peers, last-first, p50, mx, cov, held, cpu/n, rss/1024 }' "$d/node.csv"
+    done | paste -sd, -
+)
+
+[ -n "$runs" ] || { echo "no completed runs found in $RESULTS" >&2; exit 1; }
+
+# Lag-over-time traces for the runs the report charts by name.
+series=$(
+    for d in light-2000-r1 light-3500-r1 light-5000-r2 light-5000-r1; do
+        [ -f "$RESULTS/$d/node.csv" ] || continue
+        printf '"%s":[%s]\n' "$d" "$(awk -F, -v ab="$ANCHOR_BLOCK" -v am="$ANCHOR_MS" -v bs="$BLOCK_SECS" '
+            NR>2 { t=$1/1000; if (t0==0) t0=t; lag=(ab+(t-am)/bs-$7)*bs
+                   if (n==0) base=lag
+                   printf "%s[%.0f,%.1f]", (n++ ? "," : ""), t-t0, lag-base }' "$RESULTS/$d/node.csv")"
+    done | paste -sd, -
+)
+
+# libp2p-node busy fractions: measured with ./run-task-busy, not derivable from
+# the CSVs, so they are stated here. Update if you re-measure.
+busy='{"label":"idle (~24 peers)","peers":24,"v":21.4},{"label":"2000 held","peers":2000,"v":43.1},{"label":"5000 held","peers":5000,"v":65.2}'
+
+python3 - "$TEMPLATE" "$OUT" "$runs" "$series" "$busy" <<'PY'
+import sys, json
+template, out, runs, series, busy = sys.argv[1:6]
+data = '{"runs":[%s],"series":{%s},"busy":[%s]}' % (runs, series, busy)
+json.loads(data)  # fail loudly here rather than silently in the browser
+html = open(template).read()
+assert '__DATA__' in html, 'template has no __DATA__ placeholder'
+open(out, 'w').write(html.replace('__DATA__', data))
+print('wrote %s (%d runs)' % (out, len(json.loads(data)['runs'])))
+PY

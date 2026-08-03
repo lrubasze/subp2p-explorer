@@ -1,0 +1,736 @@
+<title>Light-peer capacity of a Kusama full node</title>
+
+<style>
+  :root {
+    color-scheme: light;
+    --plane: #f2f3ef;
+    --surface: #fcfcfb;
+    --ink: #0b0b0b;
+    --ink-2: #52514e;
+    --muted: #898781;
+    --grid: #e1e0d9;
+    --axis: #c3c2b7;
+    --rule: rgba(11, 11, 11, 0.10);
+    --s1: #2a78d6;
+    --s2: #eb6834;
+    --s3: #1baf7a;
+    --s4: #eda100;
+    --band: rgba(235, 104, 52, 0.09);
+    --shadow: 0 1px 2px rgba(11, 11, 11, .05), 0 8px 24px -18px rgba(11, 11, 11, .35);
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --plane: #0d0d0d;
+      --surface: #1a1a19;
+      --ink: #ffffff;
+      --ink-2: #c3c2b7;
+      --muted: #898781;
+      --grid: #2c2c2a;
+      --axis: #383835;
+      --rule: rgba(255, 255, 255, 0.10);
+      --s1: #3987e5;
+      --s2: #d95926;
+      --s3: #199e70;
+      --s4: #c98500;
+      --band: rgba(217, 89, 38, 0.14);
+      --shadow: none;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --plane: #0d0d0d;
+    --surface: #1a1a19;
+    --ink: #ffffff;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --rule: rgba(255, 255, 255, 0.10);
+    --s1: #3987e5;
+    --s2: #d95926;
+    --s3: #199e70;
+    --s4: #c98500;
+    --band: rgba(217, 89, 38, 0.14);
+    --shadow: none;
+  }
+
+  body {
+    margin: 0;
+    background: var(--plane);
+    color: var(--ink);
+    font-family: var(--sans);
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap {
+    max-width: 1080px;
+    margin: 0 auto;
+    padding: 48px 24px 96px;
+    display: flex;
+    flex-direction: column;
+    gap: 40px;
+  }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0;
+  }
+
+  h1 {
+    font-size: clamp(28px, 4.4vw, 42px);
+    line-height: 1.12;
+    letter-spacing: -.021em;
+    margin: 10px 0 0;
+    text-wrap: balance;
+    font-weight: 620;
+  }
+
+  .lede {
+    margin: 14px 0 0;
+    max-width: 66ch;
+    color: var(--ink-2);
+    font-size: 17px;
+  }
+
+  h2 {
+    font-size: 20px;
+    letter-spacing: -.012em;
+    margin: 0;
+    font-weight: 600;
+  }
+
+  .note {
+    margin: 0;
+    color: var(--ink-2);
+    max-width: 68ch;
+    font-size: 15px;
+  }
+
+  .tiles {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 14px;
+  }
+
+  .tile {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 18px 20px 20px;
+    box-shadow: var(--shadow);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .tile .k {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  .tile .v {
+    font-size: 34px;
+    font-weight: 640;
+    letter-spacing: -.025em;
+    line-height: 1.1;
+  }
+
+  .tile .s {
+    font-size: 13.5px;
+    color: var(--ink-2);
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 22px 22px 16px;
+    box-shadow: var(--shadow);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .card h2 { margin-bottom: 2px; }
+
+  .grid-2 {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
+    gap: 14px;
+  }
+
+  figure { margin: 0; }
+
+  .chart-host { position: relative; }
+
+  svg { display: block; width: 100%; height: auto; overflow: visible; }
+
+  .tick {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    fill: var(--muted);
+  }
+
+  .axis-title {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    fill: var(--muted);
+  }
+
+  .mark-label {
+    font-family: var(--mono);
+    font-size: 11px;
+    fill: var(--ink-2);
+  }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 18px;
+    padding: 2px 0 0;
+    font-size: 13px;
+    color: var(--ink-2);
+  }
+
+  .legend span {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+  }
+
+  .swatch {
+    width: 11px;
+    height: 11px;
+    border-radius: 2px;
+    flex: none;
+  }
+
+  .tip {
+    position: absolute;
+    pointer-events: none;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    padding: 7px 10px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    line-height: 1.5;
+    color: var(--ink);
+    box-shadow: 0 4px 16px -6px rgba(0, 0, 0, .3);
+    white-space: nowrap;
+    opacity: 0;
+    transition: opacity .1s ease;
+    z-index: 5;
+  }
+
+  .tip.on { opacity: 1; }
+
+  .table-scroll { overflow-x: auto; }
+
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  th, td {
+    text-align: right;
+    padding: 7px 12px;
+    border-bottom: 1px solid var(--grid);
+    white-space: nowrap;
+  }
+
+  th:first-child, td:first-child { text-align: left; }
+
+  thead th {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 500;
+    border-bottom-color: var(--axis);
+  }
+
+  tbody tr:hover { background: color-mix(in srgb, var(--s1) 6%, transparent); }
+
+  td.flag { color: var(--s2); font-weight: 600; }
+
+  footer {
+    color: var(--muted);
+    font-size: 13px;
+    border-top: 1px solid var(--rule);
+    padding-top: 18px;
+    max-width: 72ch;
+  }
+
+  code {
+    font-family: var(--mono);
+    font-size: .92em;
+    background: color-mix(in srgb, var(--ink) 6%, transparent);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; }
+  }
+</style>
+
+<div class="wrap">
+
+  <header>
+    <p class="eyebrow">subp2p-explorer &middot; kusama full node &middot; 17 runs &middot; 3 aug 2026</p>
+    <h1>How many light peers a full node carries before it loses the chain</h1>
+    <p class="lede">
+      Every peer count up to 5000 was admitted without a single refusal, so the
+      <code>--in-peers-light</code> gate itself is not the constraint. What breaks first is
+      the node's ability to keep up with Kusama's head — and it starts breaking between
+      3500 and 4250 held light peers.
+    </p>
+  </header>
+
+  <section class="tiles">
+    <div class="tile">
+      <span class="k">Recommended default</span>
+      <span class="v">2000</span>
+      <span class="s">Flat across four runs, roughly 2&times; margin to the knee.</span>
+    </div>
+    <div class="tile">
+      <span class="k">Measured knee</span>
+      <span class="v">3500&ndash;4250</span>
+      <span class="s">Clean at 3500 twice; loses ground at 4250 twice.</span>
+    </div>
+    <div class="tile">
+      <span class="k">Worst observed stall</span>
+      <span class="v">130 s</span>
+      <span class="s">At 5000 peers the node imported no block at all, then recovered.</span>
+    </div>
+    <div class="tile">
+      <span class="k">Announcement coverage</span>
+      <span class="v">100%</span>
+      <span class="s">Every run, every peer count. Delivery never degraded.</span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>The knee: how far the node fell behind during each run</h2>
+    <p class="note">
+      Each dot is one 300-second run. The value is how much the node's distance behind the
+      chain tip <em>grew</em> over the run, so zero means it kept pace and positive means it
+      lost ground. Kusama itself produced blocks at exactly 6.0&nbsp;s throughout, verified
+      from on-chain authorship timestamps, so this is the node and not the network.
+    </p>
+    <figure class="chart-host" id="host-knee">
+      <svg id="chart-knee" viewBox="0 0 940 380" role="img"
+           aria-label="Lag growth against peer count. Flat near zero up to 3500 peers, rising at 4250, and reaching 150 seconds at 5000."></svg>
+      <div class="tip" id="tip-knee"></div>
+    </figure>
+  </section>
+
+  <section class="card">
+    <h2>What actually saturates: one async task, not the machine</h2>
+    <p class="note">
+      The bottleneck is <code>libp2p-node</code>, the litep2p event loop. It is a single async
+      task, so it cannot exceed 100% however many cores are idle. The host has 16 cores and the
+      whole process never used more than about one of them; no individual thread went past 11%,
+      because the task migrates across workers and hides from per-thread CPU tools.
+    </p>
+    <figure class="chart-host" id="host-busy">
+      <svg id="chart-busy" viewBox="0 0 940 250" role="img"
+           aria-label="libp2p-node task busy fraction: 21.4 percent idle, 43.1 percent at 2000 peers, 65.2 percent at 5000 peers."></svg>
+      <div class="tip" id="tip-busy"></div>
+    </figure>
+  </section>
+
+  <section class="card">
+    <h2>The stall, as it happened</h2>
+    <p class="note">
+      Lag against the chain tip over the course of four representative runs, each starting from
+      its own baseline. At 2000 and 3500 the traces stay flat. The two 5000-peer runs both climb;
+      one of them simply stops importing for the last 130 seconds.
+    </p>
+    <figure class="chart-host" id="host-series">
+      <svg id="chart-series" viewBox="0 0 940 360" role="img"
+           aria-label="Lag over time for four runs. The 2000 and 3500 peer runs stay flat; both 5000 peer runs climb, one steeply."></svg>
+      <div class="tip" id="tip-series"></div>
+    </figure>
+    <div class="legend" id="legend-series"></div>
+  </section>
+
+  <div class="grid-2">
+    <section class="card">
+      <h2>Announcement spread</h2>
+      <p class="note">
+        Time from the first holder to the last to receive the same block. Linear in peer count
+        up to 2000, then flattening &mdash; though at the high end our own 5000-swarm client adds
+        scheduling delay, so treat the tail as approximate.
+      </p>
+      <figure class="chart-host" id="host-spread">
+        <svg id="chart-spread" viewBox="0 0 460 300" role="img"
+             aria-label="Median announcement spread rises from 1.3 milliseconds at 100 peers to about 36 milliseconds at 5000."></svg>
+        <div class="tip" id="tip-spread"></div>
+      </figure>
+    </section>
+
+    <section class="card">
+      <h2>Node memory</h2>
+      <p class="note">
+        Peak resident set during each run. The slope works out to roughly 0.3&nbsp;MB per held
+        peer &mdash; memory is never the binding constraint on a 125&nbsp;GB host.
+      </p>
+      <figure class="chart-host" id="host-rss">
+        <svg id="chart-rss" viewBox="0 0 460 300" role="img"
+             aria-label="Peak node memory rises from about 1.3 gigabytes at 100 peers to about 2.9 gigabytes at 5000."></svg>
+        <div class="tip" id="tip-rss"></div>
+      </figure>
+    </section>
+  </div>
+
+  <section class="card">
+    <h2>Every run</h2>
+    <p class="note">
+      Lag growth is the decision column; runs past the knee are marked. Coverage was 100% and
+      refusals were zero in all 17 runs, so neither column is repeated here.
+    </p>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th scope="col">Run</th>
+            <th scope="col">Peers held</th>
+            <th scope="col">Lag growth</th>
+            <th scope="col">Spread p50</th>
+            <th scope="col">Spread max</th>
+            <th scope="col">CPU avg</th>
+            <th scope="col">Peak RSS</th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer>
+    Measured against a Kusama full node (<code>--in-peers-light 5000</code>, litep2p backend,
+    16 cores, 125&nbsp;GB) driven by <code>subp2p-explorer</code>'s <code>hold-peers</code>.
+    Each run holds N fake light peers for 300&nbsp;s after a 10&nbsp;ms-per-peer ramp. Node-side
+    samples come from the node's own Prometheus endpoint every 5&nbsp;s; task busy fractions from
+    <code>substrate_tasks_polling_duration</code> deltas. Lag is derived against a 6.0&nbsp;s
+    block time anchored on verified on-chain timestamps, and is reported as growth within a run
+    to cancel anchor drift.
+  </footer>
+
+</div>
+
+<script id="run-data" type="application/json">__DATA__</script>
+
+<script>
+  (function () {
+    const D = JSON.parse(document.getElementById('run-data').textContent);
+    const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+    const SVGNS = 'http://www.w3.org/2000/svg';
+
+    function el(tag, attrs) {
+      const n = document.createElementNS(SVGNS, tag);
+      for (const k in attrs) n.setAttribute(k, attrs[k]);
+      return n;
+    }
+
+    function tipFor(hostId, tipId) {
+      const host = document.getElementById(hostId);
+      const tip = document.getElementById(tipId);
+      return {
+        show(evt, html) {
+          tip.innerHTML = html;
+          tip.classList.add('on');
+          const hb = host.getBoundingClientRect();
+          let x = evt.clientX - hb.left + 12;
+          let y = evt.clientY - hb.top - 10;
+          if (x + tip.offsetWidth > hb.width) x = evt.clientX - hb.left - tip.offsetWidth - 12;
+          if (y < 0) y = 0;
+          tip.style.left = x + 'px';
+          tip.style.top = y + 'px';
+        },
+        hide() { tip.classList.remove('on'); }
+      };
+    }
+
+    function niceTicks(min, max, count) {
+      const span = max - min || 1;
+      const raw = span / count;
+      const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+      const norm = raw / mag;
+      const step = (norm >= 5 ? 10 : norm >= 2 ? 5 : norm >= 1 ? 2 : 1) * mag;
+      const out = [];
+      for (let v = Math.ceil(min / step) * step; v <= max + 1e-9; v += step) out.push(+v.toFixed(6));
+      return out;
+    }
+
+    function frame(svg, box, xs, ys, xLabel, yLabel, fmtX, fmtY) {
+      const g = el('g', {});
+      ys.forEach((v) => {
+        const y = box.y(v);
+        g.appendChild(el('line', {
+          x1: box.l, x2: box.l + box.w, y1: y, y2: y,
+          stroke: v === 0 ? css('--axis') : css('--grid'), 'stroke-width': 1
+        }));
+        const t = el('text', { x: box.l - 9, y: y + 3.5, class: 'tick', 'text-anchor': 'end' });
+        t.textContent = fmtY(v);
+        g.appendChild(t);
+      });
+      xs.forEach((v) => {
+        const x = box.x(v);
+        const t = el('text', { x: x, y: box.t + box.h + 20, class: 'tick', 'text-anchor': 'middle' });
+        t.textContent = fmtX(v);
+        g.appendChild(t);
+      });
+      g.appendChild(el('line', {
+        x1: box.l, x2: box.l + box.w, y1: box.t + box.h, y2: box.t + box.h,
+        stroke: css('--axis'), 'stroke-width': 1
+      }));
+      const xt = el('text', { x: box.l + box.w, y: box.t + box.h + 40, class: 'axis-title', 'text-anchor': 'end' });
+      xt.textContent = xLabel;
+      g.appendChild(xt);
+      const yt = el('text', { x: box.l - 9, y: box.t - 14, class: 'axis-title', 'text-anchor': 'end' });
+      yt.textContent = yLabel;
+      g.appendChild(yt);
+      svg.appendChild(g);
+    }
+
+    function makeBox(svg, pad) {
+      const vb = svg.viewBox.baseVal;
+      return { l: pad.l, t: pad.t, w: vb.width - pad.l - pad.r, h: vb.height - pad.t - pad.b };
+    }
+
+    /* ---------- 1. knee scatter ---------- */
+    (function () {
+      const svg = document.getElementById('chart-knee');
+      const tip = tipFor('host-knee', 'tip-knee');
+      const b = makeBox(svg, { l: 62, r: 22, t: 26, b: 52 });
+      const xmax = 5300, ymin = -20, ymax = 160;
+      b.x = (v) => b.l + (v / xmax) * b.w;
+      b.y = (v) => b.t + b.h - ((v - ymin) / (ymax - ymin)) * b.h;
+
+      // knee band: 3500 clean, 4250 degraded
+      svg.appendChild(el('rect', {
+        x: b.x(3500), y: b.t, width: b.x(4250) - b.x(3500), height: b.h, fill: css('--band')
+      }));
+      const bl = el('text', { x: (b.x(3500) + b.x(4250)) / 2, y: b.t + 14, class: 'mark-label', 'text-anchor': 'middle' });
+      bl.textContent = 'knee';
+      svg.appendChild(bl);
+
+      frame(svg, b, [0, 1000, 2000, 3000, 4000, 5000], niceTicks(ymin, ymax, 5),
+        'light peers held', 'lag growth (s)', (v) => v.toLocaleString(), (v) => v + 's');
+
+      D.runs.forEach((r) => {
+        const c = el('circle', {
+          cx: b.x(r.peers), cy: b.y(r.lag), r: 6.5,
+          fill: css('--s1'), stroke: css('--surface'), 'stroke-width': 2
+        });
+        c.addEventListener('mouseenter', (e) => tip.show(e,
+          '<b>' + r.run + '</b><br>lag growth ' + (r.lag > 0 ? '+' : '') + r.lag + 's<br>' +
+          r.held.toLocaleString() + ' held &middot; CPU ' + r.cpu + '%'));
+        c.addEventListener('mousemove', (e) => tip.show(e,
+          '<b>' + r.run + '</b><br>lag growth ' + (r.lag > 0 ? '+' : '') + r.lag + 's<br>' +
+          r.held.toLocaleString() + ' held &middot; CPU ' + r.cpu + '%'));
+        c.addEventListener('mouseleave', tip.hide);
+        svg.appendChild(c);
+      });
+
+      const worst = D.runs.reduce((a, r) => (r.lag > a.lag ? r : a), D.runs[0]);
+      const lab = el('text', {
+        x: b.x(worst.peers) - 12, y: b.y(worst.lag) + 4, class: 'mark-label', 'text-anchor': 'end'
+      });
+      lab.textContent = '+' + worst.lag + 's — 130 s with no import';
+      svg.appendChild(lab);
+    })();
+
+    /* ---------- 2. task busy bars ---------- */
+    (function () {
+      const svg = document.getElementById('chart-busy');
+      const tip = tipFor('host-busy', 'tip-busy');
+      const b = makeBox(svg, { l: 62, r: 22, t: 26, b: 52 });
+      b.y = (v) => b.t + b.h - (v / 100) * b.h;
+      const n = D.busy.length, slot = b.w / n, bw = Math.min(120, slot * 0.42);
+
+      [0, 25, 50, 75, 100].forEach((v) => {
+        const y = b.y(v);
+        svg.appendChild(el('line', {
+          x1: b.l, x2: b.l + b.w, y1: y, y2: y,
+          stroke: v === 100 ? css('--axis') : css('--grid'),
+          'stroke-width': 1, 'stroke-dasharray': v === 100 ? '4 4' : 'none'
+        }));
+        const t = el('text', { x: b.l - 9, y: y + 3.5, class: 'tick', 'text-anchor': 'end' });
+        t.textContent = v + '%';
+        svg.appendChild(t);
+      });
+      const ceil = el('text', { x: b.l + b.w, y: b.y(100) - 7, class: 'mark-label', 'text-anchor': 'end' });
+      ceil.textContent = 'single task ceiling';
+      svg.appendChild(ceil);
+
+      D.busy.forEach((d, i) => {
+        const cx = b.l + slot * (i + 0.5);
+        const y = b.y(d.v);
+        const bar = el('rect', {
+          x: cx - bw / 2, y: y, width: bw, height: b.t + b.h - y,
+          fill: css('--s1'), rx: 4
+        });
+        bar.addEventListener('mousemove', (e) => tip.show(e, '<b>' + d.label + '</b><br>libp2p-node ' + d.v + '% busy'));
+        bar.addEventListener('mouseleave', tip.hide);
+        svg.appendChild(bar);
+
+        const val = el('text', { x: cx, y: y - 9, class: 'mark-label', 'text-anchor': 'middle' });
+        val.textContent = d.v + '%';
+        svg.appendChild(val);
+
+        const lab = el('text', { x: cx, y: b.t + b.h + 20, class: 'tick', 'text-anchor': 'middle' });
+        lab.textContent = d.label;
+        svg.appendChild(lab);
+      });
+
+      svg.appendChild(el('line', {
+        x1: b.l, x2: b.l + b.w, y1: b.t + b.h, y2: b.t + b.h, stroke: css('--axis'), 'stroke-width': 1
+      }));
+      const yt = el('text', { x: b.l - 9, y: b.t - 14, class: 'axis-title', 'text-anchor': 'end' });
+      yt.textContent = 'busy';
+      svg.appendChild(yt);
+    })();
+
+    /* ---------- 3. lag time series ---------- */
+    (function () {
+      const svg = document.getElementById('chart-series');
+      const tip = tipFor('host-series', 'tip-series');
+      const b = makeBox(svg, { l: 62, r: 108, t: 26, b: 52 });
+      const keys = ['light-2000-r1', 'light-3500-r1', 'light-5000-r2', 'light-5000-r1'];
+      const colors = ['--s1', '--s3', '--s4', '--s2'];
+      const names = { 'light-2000-r1': '2000', 'light-3500-r1': '3500', 'light-5000-r2': '5000 (r2)', 'light-5000-r1': '5000 (r1)' };
+
+      let tmax = 0, ymax = 10, ymin = -10;
+      keys.forEach((k) => (D.series[k] || []).forEach((p) => {
+        tmax = Math.max(tmax, p[0]); ymax = Math.max(ymax, p[1]); ymin = Math.min(ymin, p[1]);
+      }));
+      ymax = Math.ceil(ymax / 20) * 20 + 10;
+      b.x = (v) => b.l + (v / tmax) * b.w;
+      b.y = (v) => b.t + b.h - ((v - ymin) / (ymax - ymin)) * b.h;
+
+      frame(svg, b, niceTicks(0, tmax, 6), niceTicks(ymin, ymax, 5),
+        'seconds into run', 'lag vs start (s)', (v) => v + 's', (v) => v + 's');
+
+      const legend = document.getElementById('legend-series');
+      keys.forEach((k, i) => {
+        const pts = D.series[k] || [];
+        if (!pts.length) return;
+        const col = css(colors[i]);
+        const d = pts.map((p, j) => (j ? 'L' : 'M') + b.x(p[0]).toFixed(1) + ' ' + b.y(p[1]).toFixed(1)).join(' ');
+        svg.appendChild(el('path', {
+          d: d, fill: 'none', stroke: col, 'stroke-width': 2,
+          'stroke-linejoin': 'round', 'stroke-linecap': 'round'
+        }));
+        const last = pts[pts.length - 1];
+        const lab = el('text', { x: b.x(last[0]) + 8, y: b.y(last[1]) + 4, class: 'mark-label', 'text-anchor': 'start' });
+        lab.setAttribute('fill', css('--ink-2'));
+        lab.textContent = names[k];
+        svg.appendChild(lab);
+
+        const sw = document.createElement('span');
+        sw.innerHTML = '<i class="swatch" style="background:' + col + '"></i>' + names[k] + ' peers';
+        legend.appendChild(sw);
+      });
+
+      const hit = el('rect', { x: b.l, y: b.t, width: b.w, height: b.h, fill: 'transparent' });
+      const cross = el('line', { y1: b.t, y2: b.t + b.h, stroke: css('--axis'), 'stroke-width': 1, opacity: 0 });
+      svg.appendChild(cross);
+      hit.addEventListener('mousemove', (e) => {
+        const r = svg.getBoundingClientRect();
+        const vx = ((e.clientX - r.left) / r.width) * svg.viewBox.baseVal.width;
+        const t = ((vx - b.l) / b.w) * tmax;
+        cross.setAttribute('x1', b.x(t)); cross.setAttribute('x2', b.x(t)); cross.setAttribute('opacity', 1);
+        let html = '<b>t = ' + Math.round(t) + 's</b>';
+        keys.forEach((k, i) => {
+          const pts = D.series[k] || [];
+          if (!pts.length) return;
+          let best = pts[0];
+          pts.forEach((p) => { if (Math.abs(p[0] - t) < Math.abs(best[0] - t)) best = p; });
+          html += '<br><i class="swatch" style="display:inline-block;background:' + css(colors[i]) +
+            '"></i> ' + names[k] + ': ' + (best[1] > 0 ? '+' : '') + best[1].toFixed(1) + 's';
+        });
+        tip.show(e, html);
+      });
+      hit.addEventListener('mouseleave', () => { tip.hide(); cross.setAttribute('opacity', 0); });
+      svg.appendChild(hit);
+    })();
+
+    /* ---------- 4 & 5. small line charts ---------- */
+    function lineChart(svgId, hostId, tipId, key, yLabel, fmt, unit) {
+      const svg = document.getElementById(svgId);
+      const tip = tipFor(hostId, tipId);
+      const b = makeBox(svg, { l: 56, r: 18, t: 24, b: 50 });
+      const byPeers = {};
+      D.runs.forEach((r) => { (byPeers[r.peers] = byPeers[r.peers] || []).push(r[key]); });
+      const pts = Object.keys(byPeers).map(Number).sort((a, c) => a - c)
+        .map((p) => ({ p: p, v: byPeers[p].reduce((a, c) => a + c, 0) / byPeers[p].length, n: byPeers[p].length }));
+      const ymax = Math.max.apply(null, pts.map((d) => d.v)) * 1.12;
+      b.x = (v) => b.l + (v / 5300) * b.w;
+      b.y = (v) => b.t + b.h - (v / ymax) * b.h;
+
+      frame(svg, b, [0, 2000, 4000], niceTicks(0, ymax, 4),
+        'peers', yLabel, (v) => (v ? v / 1000 + 'k' : '0'), fmt);
+
+      svg.appendChild(el('path', {
+        d: pts.map((d, i) => (i ? 'L' : 'M') + b.x(d.p).toFixed(1) + ' ' + b.y(d.v).toFixed(1)).join(' '),
+        fill: 'none', stroke: css('--s1'), 'stroke-width': 2, 'stroke-linejoin': 'round'
+      }));
+      pts.forEach((d) => {
+        const c = el('circle', {
+          cx: b.x(d.p), cy: b.y(d.v), r: 5,
+          fill: css('--s1'), stroke: css('--surface'), 'stroke-width': 2
+        });
+        const msg = '<b>' + d.p.toLocaleString() + ' peers</b><br>' + fmt(+d.v.toFixed(1)) + unit +
+          (d.n > 1 ? '<br>mean of ' + d.n + ' runs' : '');
+        c.addEventListener('mousemove', (e) => tip.show(e, msg));
+        c.addEventListener('mouseleave', tip.hide);
+        svg.appendChild(c);
+      });
+    }
+
+    lineChart('chart-spread', 'host-spread', 'tip-spread', 'spread50', 'spread p50 (ms)', (v) => v + '', ' ms');
+    lineChart('chart-rss', 'host-rss', 'tip-rss', 'rss', 'peak rss (mb)', (v) => Math.round(v) + '', ' MB');
+
+    /* ---------- table ---------- */
+    (function () {
+      const tb = document.getElementById('tbody');
+      D.runs.forEach((r) => {
+        const tr = document.createElement('tr');
+        const degraded = r.peers >= 4250;
+        tr.innerHTML =
+          '<td>' + r.run.replace('light-', '') + '</td>' +
+          '<td>' + r.held.toLocaleString() + '</td>' +
+          '<td class="' + (degraded ? 'flag' : '') + '">' + (r.lag > 0 ? '+' : '') + r.lag.toFixed(1) + ' s</td>' +
+          '<td>' + r.spread50.toFixed(1) + ' ms</td>' +
+          '<td>' + r.spreadMax.toFixed(1) + ' ms</td>' +
+          '<td>' + r.cpu.toFixed(1) + '%</td>' +
+          '<td>' + r.rss.toLocaleString() + ' MB</td>';
+        tb.appendChild(tr);
+      });
+    })();
+  })();
+</script>
