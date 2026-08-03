@@ -31,10 +31,13 @@ use libp2p::{identity, swarm::SwarmEvent, Multiaddr, Swarm};
 use primitive_types::H256;
 use std::collections::HashMap;
 use std::error::Error;
+use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use subp2p_explorer::{
     notifications::{
         behavior::{Notifications, NotificationsToSwarm, ProtocolsData},
@@ -167,6 +170,107 @@ async fn collect_arrivals(
     }
 
     blocks
+}
+
+/// Pairs a monotonic instant with the wall clock, so event times measured with
+/// `Instant` can be written as epoch milliseconds and lined up with the node-side
+/// monitor's samples and with other runs.
+#[derive(Clone, Copy)]
+pub(crate) struct WallAnchor {
+    instant: Instant,
+    system: SystemTime,
+}
+
+impl WallAnchor {
+    pub(crate) fn now() -> Self {
+        Self {
+            instant: Instant::now(),
+            system: SystemTime::now(),
+        }
+    }
+
+    /// Wall-clock epoch milliseconds for a moment measured on the monotonic clock.
+    pub(crate) fn epoch_ms(&self, at: Instant) -> u128 {
+        let base = self.system.duration_since(UNIX_EPOCH).unwrap_or_default();
+        if at >= self.instant {
+            (base + (at - self.instant)).as_millis()
+        } else {
+            base.saturating_sub(self.instant - at).as_millis()
+        }
+    }
+}
+
+/// Appends one row per progress tick to `hold-samples.csv`. Rows carry the wall
+/// clock so the series can be plotted against the node-side monitor's CSV.
+pub(crate) struct CsvSampler {
+    file: fs::File,
+}
+
+impl CsvSampler {
+    pub(crate) fn create(path: &Path) -> std::io::Result<Self> {
+        let mut file = fs::File::create(path)?;
+        writeln!(
+            file,
+            "epoch_ms,phase,elapsed_s,offered,connected,held,peak_held,refused,evicted,announces"
+        )?;
+        Ok(Self { file })
+    }
+
+    pub(crate) fn sample(
+        &mut self,
+        metrics: &HoldMetrics,
+        phase: &str,
+        elapsed: f64,
+        offered: usize,
+    ) {
+        let epoch_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let _ = writeln!(
+            self.file,
+            "{epoch_ms},{phase},{elapsed:.1},{offered},{},{},{},{},{},{}",
+            metrics.connected.load(Ordering::Relaxed),
+            metrics.held.load(Ordering::Relaxed),
+            metrics.peak_held.load(Ordering::Relaxed),
+            metrics.refused.load(Ordering::Relaxed),
+            metrics.evicted.load(Ordering::Relaxed),
+            metrics.announces.load(Ordering::Relaxed),
+        );
+    }
+}
+
+/// Dump the per-block observations to `hold-blocks.csv` — the same rows the
+/// announcement-quality report is computed from, so spread and coverage can be
+/// recomputed offline and compared across runs. Rows outside the hold window are
+/// included but flagged, matching the report's filter.
+fn write_blocks_csv(
+    path: &Path,
+    blocks: &HashMap<u64, BlockObs>,
+    hold_start: Instant,
+    anchor: WallAnchor,
+) -> std::io::Result<()> {
+    let mut file = fs::File::create(path)?;
+    writeln!(
+        file,
+        "number,first_epoch_ms,last_epoch_ms,spread_ms,count,held_at_first,in_hold_window"
+    )?;
+    let mut rows: Vec<&BlockObs> = blocks.values().collect();
+    rows.sort_by_key(|obs| obs.first);
+    for obs in rows {
+        writeln!(
+            file,
+            "{},{},{},{:.3},{},{},{}",
+            obs.number.map(|n| n.to_string()).unwrap_or_default(),
+            anchor.epoch_ms(obs.first),
+            anchor.epoch_ms(obs.last),
+            obs.last.duration_since(obs.first).as_secs_f64() * 1000.0,
+            obs.count,
+            obs.held_at_first,
+            obs.first >= hold_start,
+        )?;
+    }
+    Ok(())
 }
 
 impl HoldMetrics {
@@ -506,8 +610,18 @@ pub async fn hold_peers(
     duration: Duration,
     idle_timeout: Duration,
     connect_timeout: Duration,
+    out_dir: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
     let peers = peers.max(1);
+
+    if let Some(dir) = &out_dir {
+        fs::create_dir_all(dir)?;
+    }
+    let mut sampler = out_dir
+        .as_ref()
+        .map(|dir| CsvSampler::create(&dir.join("hold-samples.csv")))
+        .transpose()?;
+    let anchor = WallAnchor::now();
 
     let address = address
         .or_else(|| chain.map(|c| c.address().to_string()))
@@ -623,13 +737,13 @@ pub async fn hold_peers(
             }
             // Re-checks the loop condition while nothing else is due.
             _ = settle_tick.tick().fuse() => {}
-            _ = progress_tick.tick().fuse() => print_progress(
-                &metrics,
-                "connect",
-                connect_start.elapsed().as_secs_f64(),
-                opened,
-                peers,
-            ),
+            _ = progress_tick.tick().fuse() => {
+                let elapsed = connect_start.elapsed().as_secs_f64();
+                if let Some(sampler) = sampler.as_mut() {
+                    sampler.sample(&metrics, "connect", elapsed, opened);
+                }
+                print_progress(&metrics, "connect", elapsed, opened, peers);
+            }
         }
     }
 
@@ -652,13 +766,13 @@ pub async fn hold_peers(
     loop {
         futures::select! {
             _ = (&mut hold_sleep).fuse() => break,
-            _ = progress_tick.tick().fuse() => print_progress(
-                &metrics,
-                "hold",
-                hold_start.elapsed().as_secs_f64(),
-                opened,
-                peers,
-            ),
+            _ = progress_tick.tick().fuse() => {
+                let elapsed = hold_start.elapsed().as_secs_f64();
+                if let Some(sampler) = sampler.as_mut() {
+                    sampler.sample(&metrics, "hold", elapsed, opened);
+                }
+                print_progress(&metrics, "hold", elapsed, opened, peers);
+            }
         }
     }
 
@@ -666,6 +780,9 @@ pub async fn hold_peers(
     // Read the count before telling the holders to stop, so none of them can
     // release its slot first.
     let steady_held = metrics.held.load(Ordering::Relaxed);
+    if let Some(sampler) = sampler.as_mut() {
+        sampler.sample(&metrics, "hold", hold_secs, opened);
+    }
     let _ = stop_tx.send(true);
     println!("\nHold window over, draining {} peer(s)...", handles.len());
 
@@ -695,6 +812,15 @@ pub async fn hold_peers(
         hold_secs,
     );
     print_announcement_quality(&blocks, hold_start);
+
+    if let Some(dir) = &out_dir {
+        write_blocks_csv(&dir.join("hold-blocks.csv"), &blocks, hold_start, anchor)?;
+        println!(
+            "\nwrote {} and {}",
+            dir.join("hold-samples.csv").display(),
+            dir.join("hold-blocks.csv").display(),
+        );
+    }
 
     Ok(())
 }

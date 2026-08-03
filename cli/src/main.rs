@@ -131,6 +131,11 @@ pub struct HoldPeersOpts {
     /// its own idle timeout (10s by default), whatever this is set to.
     #[clap(long, default_value = "300", value_parser = parse_duration)]
     idle_timeout: std::time::Duration,
+    /// Directory to also write machine-readable results into, for plotting:
+    /// hold-samples.csv (one row per second) and hold-blocks.csv (one row per
+    /// announcement). Created if missing.
+    #[clap(long)]
+    out_dir: Option<std::path::PathBuf>,
 }
 
 /// Spam the `/<genesis>/light/2` request-response protocol of an appointed full
@@ -591,6 +596,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 opts.duration,
                 opts.idle_timeout,
                 opts.connect_timeout,
+                opts.out_dir,
             )
             .await
         }
