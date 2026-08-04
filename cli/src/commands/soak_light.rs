@@ -21,7 +21,8 @@
 use crate::commands::authorities::fetch_genesis_hash;
 use crate::commands::light_common::{
     build_swarm, classify_failure, head_source, merge_error_map, parse_method_spec, percentile_ms,
-    print_dotns_derivation, Chain, Head, MethodKind, MethodStats, SpamBehaviour, SpamBehaviourEvent,
+    print_dotns_derivation, record_light_response, Chain, Head, MethodKind, MethodStats,
+    SpamBehaviour, SpamBehaviourEvent,
 };
 use futures::{future::join_all, FutureExt, StreamExt};
 use jsonrpsee::client_transport::ws::Url;
@@ -45,6 +46,8 @@ use tokio::time::Instant as TokioInstant;
 struct SoakMetrics {
     issued: AtomicU64,
     ok: AtomicU64,
+    /// Response arrived with no proof — the node could not serve it.
+    unserved: AtomicU64,
     /// `Err(())` — node closed the substream with no response (load-shedding).
     shed: AtomicU64,
     timeout: AtomicU64,
@@ -219,16 +222,17 @@ async fn run_connection(
         let st = &mut report.stats[idx];
         match await_request(&mut swarm, req_id, deadline).await {
             Outcome::Responded(Ok(bytes)) => {
-                st.ok += 1;
-                metrics.ok.fetch_add(1, Ordering::Relaxed);
-                st.latencies_us.push(t0.elapsed().as_micros() as u64);
-                if let Ok(decoded) = light::decode_response(&bytes) {
-                    if let Some(p) = decoded.proof_len() {
-                        st.proof_bytes_total += p as u64;
-                    }
-                    if st.sample.is_none() {
-                        st.sample = Some(format!("{decoded:?} ({} wire bytes)", bytes.len()));
-                    }
+                let before = st.ok;
+                let reason = record_light_response(st, &bytes, t0.elapsed().as_micros() as u64);
+                let served = st.ok > before;
+                if let Some(reason) = reason {
+                    st.last_err = Some(reason.clone());
+                    *report.errors.entry(reason).or_insert(0) += 1;
+                }
+                if served {
+                    metrics.ok.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    metrics.unserved.fetch_add(1, Ordering::Relaxed);
                 }
             }
             Outcome::Responded(Err(())) => {
@@ -266,9 +270,10 @@ fn print_progress(m: &SoakMetrics, start: Instant, opened: usize, clients: usize
     let err = m.err.load(Ordering::Relaxed);
     let concurrent = m.concurrent.load(Ordering::Relaxed);
     let peak = m.peak_concurrent.load(Ordering::Relaxed);
+    let unserved = m.unserved.load(Ordering::Relaxed);
     let elapsed = start.elapsed().as_secs_f64().max(0.001);
     print!(
-        "\r  t={:.0}s opened={opened}/{clients} concurrent={concurrent}(peak {peak}) | offered {:.0}/s served {:.0}/s shed {:.0}/s | ok={ok} shed={shed} timeout={timeout} err={err}   ",
+        "\r  t={:.0}s opened={opened}/{clients} concurrent={concurrent}(peak {peak}) | offered {:.0}/s served {:.0}/s shed {:.0}/s | ok={ok} unserved={unserved} shed={shed} timeout={timeout} err={err}   ",
         elapsed,
         issued as f64 / elapsed,
         ok as f64 / elapsed,
@@ -311,9 +316,10 @@ fn print_report(
     light_protocol: &str,
 ) {
     let mut all: Vec<u64> = Vec::new();
-    let (mut ok, mut timeout, mut proof) = (0u64, 0u64, 0u64);
+    let (mut ok, mut unserved, mut timeout, mut proof) = (0u64, 0u64, 0u64, 0u64);
     for s in stats {
         ok += s.ok;
+        unserved += s.unserved;
         timeout += s.timeout;
         proof += s.proof_bytes_total;
         all.extend_from_slice(&s.latencies_us);
@@ -333,16 +339,22 @@ fn print_report(
     println!(
         "load:       rate={rate}/s clients={clients} (lifetime={lifetime} req/conn, new conn every {t_open:.2}s)"
     );
-    println!(
-        "duration:   {elapsed:.1}s | clients opened {opened} | peak concurrent {peak}"
-    );
+    println!("duration:   {elapsed:.1}s | clients opened {opened} | peak concurrent {peak}");
     println!(
         "offered:    {:.0} req/s (issued {issued}) | served {:.0} req/s | shed {:.0} req/s",
         issued as f64 / elapsed,
         ok as f64 / elapsed,
         shed as f64 / elapsed,
     );
-    println!("requests:   ok={ok} shed={shed} timeout={timeout} other_err={other_err}");
+    println!(
+        "requests:   ok={ok} unserved={unserved} shed={shed} timeout={timeout} other_err={other_err}"
+    );
+    if unserved > 0 {
+        println!("  note: {unserved} response(s) carried no proof: the node answered but could");
+        println!("        not serve the request — runtime method absent on this chain, or a");
+        println!("        pruned block. Not successes; they also skip execution, so their");
+        println!("        latency is listed separately per method rather than mixed in.");
+    }
     println!(
         "send->resp ms: p50={:.1} p90={:.1} p99={:.1} | proof bytes total={proof}",
         percentile_ms(&all, 50),
@@ -369,15 +381,37 @@ fn print_report(
         let s = &stats[i];
         let mut lat = s.latencies_us.clone();
         lat.sort_unstable();
-        let avg_proof = if s.ok > 0 { s.proof_bytes_total / s.ok } else { 0 };
+        let avg_proof = if s.ok > 0 {
+            s.proof_bytes_total / s.ok
+        } else {
+            0
+        };
         println!(
-            "  {label}: issued={} ok={} err={} timeout={} | p50={:.1}ms p99={:.1}ms | avg proof={}B{}",
+            "  {label}: issued={} ok={}{} err={} timeout={} | {} | avg proof={}B{}",
             s.issued,
             s.ok,
+            if s.unserved > 0 {
+                let mut u = s.unserved_us.clone();
+                u.sort_unstable();
+                format!(
+                    " unserved={} (p50={:.1}ms)",
+                    s.unserved,
+                    percentile_ms(&u, 50)
+                )
+            } else {
+                String::new()
+            },
             s.err,
             s.timeout,
-            percentile_ms(&lat, 50),
-            percentile_ms(&lat, 99),
+            if s.ok > 0 {
+                format!(
+                    "p50={:.1}ms p99={:.1}ms",
+                    percentile_ms(&lat, 50),
+                    percentile_ms(&lat, 99)
+                )
+            } else {
+                "p50=n/a p99=n/a".to_string()
+            },
             avg_proof,
             s.sample
                 .as_ref()
@@ -429,7 +463,9 @@ pub async fn soak_light(
     let light_protocol = protocol.unwrap_or_else(|| light::protocol_name(&genesis));
 
     let duration_secs = duration.as_secs_f64();
-    let lifetime = ((rate as f64 * duration_secs) / clients as f64).round().max(1.0) as usize;
+    let lifetime = ((rate as f64 * duration_secs) / clients as f64)
+        .round()
+        .max(1.0) as usize;
     let t_open = duration_secs / clients as f64;
 
     println!("URL:         {url}");
@@ -555,7 +591,10 @@ pub async fn soak_light(
             _ = drift_tick.tick().fuse() => print_drift(&metrics, &mut last_drift),
         }
     }
-    println!("\nDuration reached, draining {} connection(s)...", handles.len());
+    println!(
+        "\nDuration reached, draining {} connection(s)...",
+        handles.len()
+    );
 
     pacer_task.abort();
     let results = join_all(handles).await;
@@ -576,10 +615,12 @@ pub async fn soak_light(
             let m = &mut merged[i];
             m.issued += s.issued;
             m.ok += s.ok;
+            m.unserved += s.unserved;
             m.err += s.err;
             m.timeout += s.timeout;
             m.proof_bytes_total += s.proof_bytes_total;
             m.latencies_us.extend(s.latencies_us);
+            m.unserved_us.extend(s.unserved_us);
             if m.sample.is_none() {
                 m.sample = s.sample;
             }

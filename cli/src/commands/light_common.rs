@@ -445,7 +445,10 @@ pub(crate) fn print_dotns_derivation(methods: &[(String, MethodKind)]) {
                     "    slotKey  = keccak256(namehash ++ uint256(slot)) = 0x{}",
                     hex::encode(e.slot_key)
                 );
-                println!("    address  = 0x{}  (DOTNS_REGISTRY)", hex::encode(e.address));
+                println!(
+                    "    address  = 0x{}  (DOTNS_REGISTRY)",
+                    hex::encode(e.address)
+                );
                 println!(
                     "    data     = address ++ slotKey = 0x{}  ({} bytes)",
                     hex::encode(&e.data),
@@ -518,7 +521,9 @@ pub(crate) async fn head_source(
             }
         };
         while let Some(Ok(header)) = sub.next().await {
-            let Some(num) = header_number(&header) else { continue };
+            let Some(num) = header_number(&header) else {
+                continue;
+            };
             if let Ok(hash_hex) = rpc
                 .request::<String, _>("chain_getBlockHash", rpc_params![num])
                 .await
@@ -540,13 +545,63 @@ pub(crate) async fn head_source(
 #[derive(Default)]
 pub(crate) struct MethodStats {
     pub issued: u64,
+    /// A response that actually carried a proof.
     pub ok: u64,
+    /// A response arrived, but with no proof: the node could not serve the
+    /// request. `RemoteCallResponse { proof: None }` is what substrate replies
+    /// with when the runtime call fails — an unknown runtime method, a pruned
+    /// block — and it logs that at trace only
+    /// (`light_client_requests/handler.rs:194-206`). Counted apart from `ok`
+    /// because it is closer to a failure, and apart from `err` because the node
+    /// did answer. Its latency is tracked separately too: an unserved call skips
+    /// execution, so folding it into `latencies_us` would flatter the numbers.
+    pub unserved: u64,
     pub err: u64,
     pub timeout: u64,
     pub proof_bytes_total: u64,
     pub latencies_us: Vec<u64>,
+    /// Latencies of the `unserved` responses — a useful control, since it is the
+    /// round-trip cost with the proving work removed.
+    pub unserved_us: Vec<u64>,
     pub sample: Option<String>,
     pub last_err: Option<String>,
+}
+
+/// Fold a decoded `/light/2` response into per-method stats, splitting a served
+/// proof from a proof-less reply.
+///
+/// Returns the human-readable reason if the body could not be decoded at all, so
+/// the caller can add it to its error map.
+pub(crate) fn record_light_response(
+    st: &mut MethodStats,
+    bytes: &[u8],
+    latency_us: u64,
+) -> Option<String> {
+    match light::decode_response(bytes) {
+        Ok(decoded) => {
+            if st.sample.is_none() {
+                st.sample = Some(format!("{decoded:?} ({} wire bytes)", bytes.len()));
+            }
+            match decoded.proof_len() {
+                Some(p) => {
+                    st.ok += 1;
+                    st.proof_bytes_total += p as u64;
+                    st.latencies_us.push(latency_us);
+                }
+                None => {
+                    st.unserved += 1;
+                    st.unserved_us.push(latency_us);
+                }
+            }
+            None
+        }
+        Err(e) => {
+            // Well-framed but not valid protobuf. Not a served proof either.
+            st.unserved += 1;
+            st.unserved_us.push(latency_us);
+            Some(format!("undecodable response body: {e}"))
+        }
+    }
 }
 
 /// Classify an [`OutboundFailure`] into a stable, human-readable bucket key.

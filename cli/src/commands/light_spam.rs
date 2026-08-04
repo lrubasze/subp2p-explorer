@@ -21,7 +21,8 @@
 use crate::commands::authorities::fetch_genesis_hash;
 use crate::commands::light_common::{
     build_swarm, classify_failure, head_source, merge_error_map, parse_method_spec, percentile_ms,
-    print_dotns_derivation, Chain, Head, MethodKind, MethodStats, SpamBehaviour, SpamBehaviourEvent,
+    print_dotns_derivation, record_light_response, Chain, Head, MethodKind, MethodStats,
+    SpamBehaviour, SpamBehaviourEvent,
 };
 use futures::{future::join_all, FutureExt, StreamExt};
 use jsonrpsee::client_transport::ws::Url;
@@ -49,6 +50,8 @@ use tokio::sync::watch;
 struct Metrics {
     issued: AtomicU64,
     ok: AtomicU64,
+    /// Response arrived with no proof — the node could not serve it.
+    unserved: AtomicU64,
     err: AtomicU64,
     timeout: AtomicU64,
     in_flight: AtomicU64,
@@ -107,7 +110,11 @@ impl LightSpammer {
             let idx = self.schedule[self.issued % self.schedule.len()];
             let (hash, num) = self.head.borrow().clone();
             let payload = self.methods[idx].1.build(&hash, num);
-            let id = self.swarm.behaviour_mut().light.send_request(&peer, payload);
+            let id = self
+                .swarm
+                .behaviour_mut()
+                .light
+                .send_request(&peer, payload);
             self.pending.insert(id, (idx, Instant::now()));
             self.stats[idx].issued += 1;
             self.issued += 1;
@@ -118,22 +125,25 @@ impl LightSpammer {
     }
 
     fn on_response(&mut self, id: OutboundRequestId, response: Result<Vec<u8>, ()>) {
-        let Some((idx, t0)) = self.pending.remove(&id) else { return };
+        let Some((idx, t0)) = self.pending.remove(&id) else {
+            return;
+        };
         self.in_flight -= 1;
         self.metrics.in_flight.fetch_sub(1, Ordering::Relaxed);
         let st = &mut self.stats[idx];
         match response {
             Ok(bytes) => {
-                st.ok += 1;
-                self.metrics.ok.fetch_add(1, Ordering::Relaxed);
-                st.latencies_us.push(t0.elapsed().as_micros() as u64);
-                if let Ok(decoded) = light::decode_response(&bytes) {
-                    if let Some(p) = decoded.proof_len() {
-                        st.proof_bytes_total += p as u64;
-                    }
-                    if st.sample.is_none() {
-                        st.sample = Some(format!("{decoded:?} ({} wire bytes)", bytes.len()));
-                    }
+                let before = st.ok;
+                if let Some(reason) =
+                    record_light_response(st, &bytes, t0.elapsed().as_micros() as u64)
+                {
+                    st.last_err = Some(reason.clone());
+                    *self.errors.entry(reason).or_insert(0) += 1;
+                }
+                if st.ok > before {
+                    self.metrics.ok.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.metrics.unserved.fetch_add(1, Ordering::Relaxed);
                 }
             }
             // Substream closed without a response (node couldn't/declined).
@@ -149,7 +159,9 @@ impl LightSpammer {
     }
 
     fn on_failure(&mut self, id: OutboundRequestId, error: OutboundFailure) {
-        let Some((idx, _t0)) = self.pending.remove(&id) else { return };
+        let Some((idx, _t0)) = self.pending.remove(&id) else {
+            return;
+        };
         self.in_flight -= 1;
         self.metrics.in_flight.fetch_sub(1, Ordering::Relaxed);
         let st = &mut self.stats[idx];
@@ -192,7 +204,10 @@ impl LightSpammer {
                     info.agent_version
                 );
                 if self.id == 0
-                    && !info.protocols.iter().any(|p| p.as_ref() == self.light_protocol)
+                    && !info
+                        .protocols
+                        .iter()
+                        .any(|p| p.as_ref() == self.light_protocol)
                 {
                     println!(
                         "WARNING: peer does not advertise {} (fork_id? pass --protocol)",
@@ -200,10 +215,9 @@ impl LightSpammer {
                     );
                 }
             }
-            SwarmEvent::Behaviour(SpamBehaviourEvent::Light(request_response::Event::Message {
-                message,
-                ..
-            })) => {
+            SwarmEvent::Behaviour(SpamBehaviourEvent::Light(
+                request_response::Event::Message { message, .. },
+            )) => {
                 if let RrMessage::Response {
                     request_id,
                     response,
@@ -276,10 +290,12 @@ fn merge_reports(
             let m = &mut merged[i];
             m.issued += s.issued;
             m.ok += s.ok;
+            m.unserved += s.unserved;
             m.err += s.err;
             m.timeout += s.timeout;
             m.proof_bytes_total += s.proof_bytes_total;
             m.latencies_us.extend(s.latencies_us);
+            m.unserved_us.extend(s.unserved_us);
             if m.sample.is_none() {
                 m.sample = s.sample;
             }
@@ -295,13 +311,14 @@ fn merge_reports(
 fn print_progress(m: &Metrics, total: usize, start: Instant) {
     let issued = m.issued.load(Ordering::Relaxed);
     let ok = m.ok.load(Ordering::Relaxed);
+    let unserved = m.unserved.load(Ordering::Relaxed);
     let err = m.err.load(Ordering::Relaxed);
     let timeout = m.timeout.load(Ordering::Relaxed);
     let in_flight = m.in_flight.load(Ordering::Relaxed);
     let connected = m.connected.load(Ordering::Relaxed);
     let elapsed = start.elapsed().as_secs_f64().max(0.001);
     print!(
-        "\r  issued={issued}/{total} conns={connected} in_flight={in_flight} ok={ok} err={err} timeout={timeout} | {:.0} req/s | {:.0}s   ",
+        "\r  issued={issued}/{total} conns={connected} in_flight={in_flight} ok={ok} unserved={unserved} err={err} timeout={timeout} | {:.0} req/s | {:.0}s   ",
         ok as f64 / elapsed,
         elapsed
     );
@@ -322,9 +339,10 @@ fn print_report(
     light_protocol: &str,
 ) {
     let mut all: Vec<u64> = Vec::new();
-    let (mut ok, mut err, mut timeout, mut proof) = (0u64, 0u64, 0u64, 0u64);
+    let (mut ok, mut unserved, mut err, mut timeout, mut proof) = (0u64, 0u64, 0u64, 0u64, 0u64);
     for s in stats {
         ok += s.ok;
+        unserved += s.unserved;
         err += s.err;
         timeout += s.timeout;
         proof += s.proof_bytes_total;
@@ -339,9 +357,15 @@ fn print_report(
         connections.saturating_mul(count)
     );
     println!(
-        "issued={issued} ok={ok} err={err} timeout={timeout} in {elapsed:.1}s => {:.0} ok req/s",
+        "issued={issued} ok={ok} unserved={unserved} err={err} timeout={timeout} in {elapsed:.1}s => {:.0} ok req/s",
         ok as f64 / elapsed
     );
+    if unserved > 0 {
+        println!("  note: {unserved} response(s) carried no proof: the node answered but could");
+        println!("        not serve the request — runtime method absent on this chain, or a");
+        println!("        pruned block. Not successes; they also skip execution, so their");
+        println!("        latency is listed separately per method rather than mixed in.");
+    }
     println!(
         "latency ms: p50={:.1} p90={:.1} p99={:.1} | proof bytes total={}",
         percentile_ms(&all, 50),
@@ -362,15 +386,39 @@ fn print_report(
         let s = &stats[i];
         let mut lat = s.latencies_us.clone();
         lat.sort_unstable();
-        let avg_proof = if s.ok > 0 { s.proof_bytes_total / s.ok } else { 0 };
+        let avg_proof = if s.ok > 0 {
+            s.proof_bytes_total / s.ok
+        } else {
+            0
+        };
+        let mut unserved_lat = s.unserved_us.clone();
+        unserved_lat.sort_unstable();
+        let unserved_note = if s.unserved > 0 {
+            format!(
+                " unserved={} (p50={:.1}ms)",
+                s.unserved,
+                percentile_ms(&unserved_lat, 50)
+            )
+        } else {
+            String::new()
+        };
+        // With nothing served there is no served latency; "0.0ms" would read as
+        // "instant" rather than "no data".
+        let served_lat = if s.ok > 0 {
+            format!(
+                "p50={:.1}ms p99={:.1}ms",
+                percentile_ms(&lat, 50),
+                percentile_ms(&lat, 99)
+            )
+        } else {
+            "p50=n/a p99=n/a".to_string()
+        };
         println!(
-            "  {label}: issued={} ok={} err={} timeout={} | p50={:.1}ms p99={:.1}ms | avg proof={}B{}{}",
+            "  {label}: issued={} ok={}{unserved_note} err={} timeout={} | {served_lat} | avg proof={}B{}{}",
             s.issued,
             s.ok,
             s.err,
             s.timeout,
-            percentile_ms(&lat, 50),
-            percentile_ms(&lat, 99),
             avg_proof,
             s.sample
                 .as_ref()
