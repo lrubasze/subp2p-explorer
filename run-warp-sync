@@ -3,18 +3,24 @@
 # Impersonate warp-syncing clients against one node, to load-test its GRANDPA
 # warp-proof server (/<genesis>/sync/warp).
 #
-# Shape of this test: each client keeps ONE request in flight, like a real
-# client, so load scales with CLIENTS rather than with pipeline depth. The node's
-# inbound warp queue is a hardcoded 20 (MAX_WARP_REQUEST_QUEUE, no CLI flag,
-# an order of magnitude below --light-client-request-queue-size), so CLIENTS
-# above ~20 is where shedding starts. That is the interesting region.
+# Two modes. Default is a BURST: CLIENTS clients arrive together, each keeping
+# ONE request in flight like a real client, so load scales with CLIENTS rather
+# than with pipeline depth. Set RATE (see below) for a SOAK instead: a sustained
+# rate over DURATION with connection churn.
+#
+# Use the burst to probe the queue, the soak to look for drift. The node's
+# inbound warp queue is a hardcoded 20 (MAX_WARP_REQUEST_QUEUE, no CLI flag, an
+# order of magnitude below --light-client-request-queue-size). Measured on
+# Kusama: it is a BURST limit, not a capacity limit — 25 clients arriving at once
+# shed 20 requests, the same 25 spread over ~1.2s shed none, at identical
+# throughput (~14.5 req/s, which saturated a 1 GbE link).
 #
 # MIND THE BANDWIDTH. Every request starting from genesis returns a full 8 MiB
 # proof — measured against the Kusama node: 8,373,366 bytes, 398 fragments,
-# is_finished=false, i.e. capped 15 kB short of MAX_WARP_SYNC_PROOF_SIZE. Total
-# egress is roughly CLIENTS x REQUESTS x 8 MiB, so the defaults here are
-# deliberately small (8 x 5 x 8 MiB ~= 320 MiB). Scale up on purpose, not by
-# accident.
+# is_finished=false, i.e. capped 15 kB short of MAX_WARP_SYNC_PROOF_SIZE. Egress
+# is roughly CLIENTS x REQUESTS x 8 MiB for a burst, RATE x DURATION x 8 MiB for
+# a soak. The burst defaults are deliberately small (8 x 5 x 8 MiB ~= 320 MiB).
+# Scale up on purpose, not by accident.
 #
 # Shedding is NOT visible in the client output alone: a shed request and a
 # refused `begin` both arrive as a closed substream with no proof. Only the
@@ -64,8 +70,26 @@ STAGGER_MS=${STAGGER_MS:-0}
 # Per-request timeout. 8 MiB over a slow link takes a while; keep this generous
 # or transfers get counted as saturation.
 REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-20}
-# Overall wall-clock cap for the run.
+# Overall wall-clock cap for the run (burst mode only).
 TIMEOUT=${TIMEOUT:-300}
+
+# --- soak mode --------------------------------------------------------------
+# Set RATE to switch from the burst above to an open-loop soak: a sustained
+# offered rate for DURATION, with connection churn (each connection sends
+# REQUESTS then reconnects with a fresh identity).
+#
+# This answers what a burst cannot — memory retention, buffers left by clients
+# that leave mid-transfer, and whether sustained warp serving interferes with
+# block import. Keep RATE well under saturation, or the run measures the link
+# rather than the node: we saw ~14.5 req/s saturate a 1 GbE link, so RATE=1
+# (~8 MiB/s) is already meaningful load while leaving plenty of headroom.
+#
+# Budget the bytes: RATE x DURATION x 8 MiB. RATE=1 for an hour is ~29 GB.
+#
+#   OUT_DIR=results/warp-soak-1h RATE=1 DURATION=3600 ./run-warp-sync
+RATE=${RATE:-}
+DURATION=${DURATION:-600}
+MAX_CONCURRENT=${MAX_CONCURRENT:-16}
 
 # Where the node lives, for the Prometheus counter snapshots. Passed through to
 # run-monitor-node as well.
@@ -76,10 +100,12 @@ PROM_PORT=${PROM_PORT:-9615}
 #
 #   OUT_DIR=results/warp-25 CLIENTS=25 ./run-warp-sync
 #
-# It collects node.csv (run-monitor-node, started here and stopped when the run
-# ends), warp-counters-before.txt / warp-counters-after.txt (the node's
-# request-response counters for this protocol, which is where shedding shows up),
-# meta.txt (the run parameters) and warp.log (this console output).
+# It collects warp-samples.csv (one row per second, written by the CLI), node.csv
+# (run-monitor-node, started here and stopped when the run ends),
+# warp-counters-before.txt / warp-counters-after.txt (the node's request-response
+# counters for this protocol, which is where shedding shows up), meta.txt (the run
+# parameters) and warp.log (this console output). Plot warp-samples.csv against
+# node.csv on epoch_ms: shed rate on one side, RSS on the other.
 # run-monitor-node's HOST / INTERVAL variables pass through. Unset, the run just
 # prints to the terminal.
 OUT_DIR=${OUT_DIR:-}
@@ -107,12 +133,18 @@ warp_counters() {
 
 # Build once: cargo build --release -p subp2p-explorer-cli
 CMD=(./target/release/subp2p-explorer-cli warp-sync $CHAIN_SOURCE --address $ADDRESS
-    --clients $CLIENTS --requests $REQUESTS --begin-block $BEGIN_BLOCK --step $STEP
-    --stagger-ms $STAGGER_MS --request-timeout $REQUEST_TIMEOUT --timeout $TIMEOUT)
+    --requests $REQUESTS --begin-block $BEGIN_BLOCK --step $STEP
+    --request-timeout $REQUEST_TIMEOUT)
 
-echo "warp-sync: $CLIENTS client(s) x $REQUESTS request(s) => ~$((CLIENTS * REQUESTS * 8)) MiB of proof"
-if [ "$CLIENTS" -gt 20 ]; then
-    echo "  CLIENTS=$CLIENTS is above the node's queue of 20: expect shedding in the counters"
+if [ -n "$RATE" ]; then
+    CMD+=(--rate $RATE --duration $DURATION --max-concurrent $MAX_CONCURRENT)
+    echo "warp-sync soak: ${RATE}/s for ${DURATION}s => ~$((RATE * DURATION * 8)) MiB of proof"
+else
+    CMD+=(--clients $CLIENTS --stagger-ms $STAGGER_MS --timeout $TIMEOUT)
+    echo "warp-sync burst: $CLIENTS client(s) x $REQUESTS request(s) => ~$((CLIENTS * REQUESTS * 8)) MiB of proof"
+    if [ "$CLIENTS" -gt 20 ]; then
+        echo "  CLIENTS=$CLIENTS is above the node's queue of 20: expect shedding in the counters"
+    fi
 fi
 
 if [ -z "$OUT_DIR" ]; then
@@ -123,8 +155,13 @@ mkdir -p "$OUT_DIR"
 {
     echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "address=$ADDRESS"
-    echo "clients=$CLIENTS requests=$REQUESTS begin_block=$BEGIN_BLOCK step=$STEP"
-    echo "stagger_ms=$STAGGER_MS request_timeout=$REQUEST_TIMEOUT timeout=$TIMEOUT"
+    echo "requests=$REQUESTS begin_block=$BEGIN_BLOCK step=$STEP"
+    if [ -n "$RATE" ]; then
+        echo "mode=soak rate=$RATE duration=$DURATION max_concurrent=$MAX_CONCURRENT"
+    else
+        echo "mode=burst clients=$CLIENTS stagger_ms=$STAGGER_MS timeout=$TIMEOUT"
+    fi
+    echo "request_timeout=$REQUEST_TIMEOUT"
 } > "$OUT_DIR/meta.txt"
 
 warp_counters > "$OUT_DIR/warp-counters-before.txt"
@@ -133,7 +170,7 @@ OUT_DIR="$OUT_DIR" ./run-monitor-node &
 MONITOR_PID=$!
 trap 'kill $MONITOR_PID 2>/dev/null' EXIT
 
-"${CMD[@]}" 2>&1 | tee "$OUT_DIR/warp.log"
+"${CMD[@]}" --out-dir "$OUT_DIR" 2>&1 | tee "$OUT_DIR/warp.log"
 
 warp_counters > "$OUT_DIR/warp-counters-after.txt"
 

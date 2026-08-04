@@ -193,8 +193,33 @@ pub struct WarpSyncOpts {
     #[clap(long, short = 'r', default_value = "10")]
     requests: usize,
     /// Delay in milliseconds between opening successive clients. 0 = all at once.
+    /// Measured on Kusama: 25 clients arriving within ~0.5s overflow the node's
+    /// queue, spread over ~1.2s they do not, at identical throughput.
     #[clap(long, default_value = "0")]
     stagger_ms: u64,
+    /// Switch to soak mode: offer this many warp requests/second, open-loop, for
+    /// --duration, with connection churn (each connection sends --requests then
+    /// reconnects with a fresh identity).
+    ///
+    /// Answers what a short burst cannot: memory retention, buffers left behind
+    /// by clients that leave mid-transfer, and whether sustained warp serving
+    /// interferes with block import. Keep the rate well below saturation —
+    /// otherwise the run measures the network link, not the node. Every proof is
+    /// ~8 MiB, so 1/s is already ~29 GB/hour.
+    #[clap(long)]
+    rate: Option<u64>,
+    /// How long to soak, in seconds. Only used with --rate.
+    #[clap(long, short = 'D', default_value = "600", value_parser = parse_duration)]
+    duration: std::time::Duration,
+    /// Ceiling on concurrent connections in soak mode. Concurrency otherwise
+    /// emerges as roughly rate x latency.
+    #[clap(long, default_value = "16")]
+    max_concurrent: usize,
+    /// Directory to also write warp-samples.csv into: one row per second, so a
+    /// soak's shed rate can be plotted against run-monitor-node's node.csv.
+    /// Created if missing.
+    #[clap(long)]
+    out_dir: Option<std::path::PathBuf>,
     /// Per-request timeout in seconds (the saturation signal).
     #[clap(long, default_value = "20", value_parser = parse_duration)]
     request_timeout: std::time::Duration,
@@ -702,6 +727,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 opts.clients,
                 opts.requests,
                 opts.stagger_ms,
+                opts.rate,
+                opts.duration,
+                opts.max_concurrent,
+                opts.out_dir,
                 opts.request_timeout,
                 opts.timeout,
             )

@@ -58,25 +58,56 @@ use libp2p::{
 };
 use std::collections::HashMap;
 use std::error::Error;
+use std::fs;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use subp2p_explorer::warp;
+use tokio::time::Instant as TokioInstant;
 
 // ---------------------------------------------------------------------------
 // Stats
 // ---------------------------------------------------------------------------
 
 /// Lock-free counters shared by all clients, read by the orchestrator for the
-/// aggregate progress line.
+/// aggregate progress line and the CSV samples.
 #[derive(Default)]
 struct Metrics {
     issued: AtomicU64,
     ok: AtomicU64,
-    err: AtomicU64,
+    /// `Err(())` — the node closed the substream with no proof. Counted apart
+    /// from `err` because this is the load-shedding signal, whereas `err` is
+    /// transport trouble on our side.
+    shed: AtomicU64,
     timeout: AtomicU64,
+    err: AtomicU64,
     bytes: AtomicU64,
+    fragments: AtomicU64,
     connected: AtomicU64,
+    /// Soak mode only: connections currently alive, and the high-water mark.
+    concurrent: AtomicU64,
+    peak_concurrent: AtomicU64,
+    opened: AtomicU64,
+}
+
+impl Metrics {
+    fn bump_concurrent(&self) {
+        let c = self.concurrent.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut p = self.peak_concurrent.load(Ordering::Relaxed);
+        while c > p {
+            match self.peak_concurrent.compare_exchange_weak(
+                p,
+                c,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(x) => p = x,
+            }
+        }
+    }
 }
 
 /// Everything one client observed, merged across clients for the summary.
@@ -84,6 +115,8 @@ struct Metrics {
 struct WarpStats {
     issued: u64,
     ok: u64,
+    /// Node closed the substream with no proof: shed, or `begin` refused.
+    shed: u64,
     err: u64,
     timeout: u64,
     bytes_total: u64,
@@ -103,6 +136,7 @@ impl WarpStats {
     fn merge(&mut self, other: WarpStats) {
         self.issued += other.issued;
         self.ok += other.ok;
+        self.shed += other.shed;
         self.err += other.err;
         self.timeout += other.timeout;
         self.bytes_total += other.bytes_total;
@@ -172,64 +206,14 @@ impl WarpClient {
         let Some((idx, t0)) = self.pending.take() else {
             return;
         };
-        match response {
-            Ok(bytes) => {
-                self.stats.ok += 1;
-                self.metrics.ok.fetch_add(1, Ordering::Relaxed);
-                self.stats
-                    .latencies_us
-                    .push(t0.elapsed().as_micros() as u64);
-                let len = bytes.len() as u64;
-                self.stats.bytes_total += len;
-                self.stats.bytes_max = self.stats.bytes_max.max(len);
-                self.metrics.bytes.fetch_add(len, Ordering::Relaxed);
-
-                match warp::summarize_response(&bytes) {
-                    Some(s) => {
-                        self.stats.fragments_total += s.fragments;
-                        if s.is_finished {
-                            self.stats.finished_responses += 1;
-                        }
-                        if self.stats.sample.is_none() {
-                            self.stats.sample = Some(format!(
-                                "{} fragments, is_finished={}, {} bytes (begin #{idx})",
-                                s.fragments, s.is_finished, s.len
-                            ));
-                        }
-                    }
-                    None => self.stats.unparseable += 1,
-                }
-            }
-            // The node closed the substream without a body. Two very different
-            // causes look identical here: the inbound queue was full and the
-            // request was silently dropped, or `begin` was rejected (not
-            // finalized / not canonical / set-change history incomplete). The
-            // node's `busy-omitted` counter separates them.
-            Err(()) => {
-                self.stats.err += 1;
-                self.metrics.err.fetch_add(1, Ordering::Relaxed);
-                let reason =
-                    "no-response: substream closed with no proof (queue-full drop or bad begin)";
-                *self.stats.errors.entry(reason.to_string()).or_insert(0) += 1;
-                self.stats.last_err = Some(reason.to_string());
-            }
-        }
+        record_response(&mut self.stats, &self.metrics, response, idx, t0);
     }
 
     fn on_failure(&mut self, error: OutboundFailure) {
         if self.pending.take().is_none() {
             return;
         }
-        if matches!(error, OutboundFailure::Timeout) {
-            self.stats.timeout += 1;
-            self.metrics.timeout.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.stats.err += 1;
-            self.metrics.err.fetch_add(1, Ordering::Relaxed);
-        }
-        let reason = classify_failure(&error);
-        self.stats.last_err = Some(reason.clone());
-        *self.stats.errors.entry(reason).or_insert(0) += 1;
+        record_failure(&mut self.stats, &self.metrics, error);
     }
 
     fn handle_event(&mut self, event: SwarmEvent<SpamBehaviourEvent>) {
@@ -360,13 +344,14 @@ fn mib(bytes: u64) -> f64 {
 fn print_progress(m: &Metrics, total: usize, start: Instant) {
     let issued = m.issued.load(Ordering::Relaxed);
     let ok = m.ok.load(Ordering::Relaxed);
+    let shed = m.shed.load(Ordering::Relaxed);
     let err = m.err.load(Ordering::Relaxed);
     let timeout = m.timeout.load(Ordering::Relaxed);
     let bytes = m.bytes.load(Ordering::Relaxed);
     let connected = m.connected.load(Ordering::Relaxed);
     let elapsed = start.elapsed().as_secs_f64().max(0.001);
     print!(
-        "\r  issued={issued}/{total} clients={connected} ok={ok} err={err} timeout={timeout} | {:.1} MiB ({:.1} MiB/s) | {:.0}s   ",
+        "\r  issued={issued}/{total} clients={connected} ok={ok} shed={shed} timeout={timeout} err={err} | {:.1} MiB ({:.1} MiB/s) | {:.0}s   ",
         mib(bytes),
         mib(bytes) / elapsed,
         elapsed
@@ -374,16 +359,95 @@ fn print_progress(m: &Metrics, total: usize, start: Instant) {
     let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
-#[allow(clippy::too_many_arguments)]
-fn print_report(
-    stats: &WarpStats,
-    elapsed: f64,
-    clients: usize,
-    connected: u64,
-    requests: usize,
-    begins: usize,
-    protocol: &str,
-) {
+/// Soak progress: rolling rates matter more than totals over a long run.
+fn print_soak_progress(m: &Metrics, start: Instant, lifetime: usize) {
+    let issued = m.issued.load(Ordering::Relaxed);
+    let ok = m.ok.load(Ordering::Relaxed);
+    let shed = m.shed.load(Ordering::Relaxed);
+    let timeout = m.timeout.load(Ordering::Relaxed);
+    let bytes = m.bytes.load(Ordering::Relaxed);
+    let concurrent = m.concurrent.load(Ordering::Relaxed);
+    let peak = m.peak_concurrent.load(Ordering::Relaxed);
+    let opened = m.opened.load(Ordering::Relaxed);
+    let elapsed = start.elapsed().as_secs_f64().max(0.001);
+    print!(
+        "\r  t={:.0}s conns={concurrent}(peak {peak}, opened {opened}x{lifetime}) | offered {:.1}/s served {:.1}/s shed {:.1}/s | {:.1} MiB/s | ok={ok} shed={shed} timeout={timeout}   ",
+        elapsed,
+        issued as f64 / elapsed,
+        ok as f64 / elapsed,
+        shed as f64 / elapsed,
+        mib(bytes) / elapsed,
+    );
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
+/// Rolling deltas since the previous snapshot, so drift over a long soak is
+/// visible in the console as well as the CSV. `last` is `(time, ok, shed, bytes)`.
+fn print_drift(m: &Metrics, last: &mut (Instant, u64, u64, u64)) {
+    let now = Instant::now();
+    let ok = m.ok.load(Ordering::Relaxed);
+    let shed = m.shed.load(Ordering::Relaxed);
+    let bytes = m.bytes.load(Ordering::Relaxed);
+    let dt = now.duration_since(last.0).as_secs_f64().max(0.001);
+    println!(
+        "\n  [drift t+{:.0}s] served {:.1}/s shed {:.1}/s {:.1} MiB/s | concurrent {} | cum ok {ok} shed {shed}",
+        dt,
+        (ok - last.1) as f64 / dt,
+        (shed - last.2) as f64 / dt,
+        mib(bytes - last.3) / dt,
+        m.concurrent.load(Ordering::Relaxed),
+    );
+    *last = (now, ok, shed, bytes);
+}
+
+// ---------------------------------------------------------------------------
+// CSV
+// ---------------------------------------------------------------------------
+
+/// One row per progress tick to `warp-samples.csv`. Stamped with the wall clock
+/// so the series lines up with run-monitor-node's node.csv — which is the whole
+/// point of a soak: RSS drift on one side against shed rate on the other.
+struct CsvSampler {
+    file: fs::File,
+}
+
+impl CsvSampler {
+    fn create(path: &Path) -> std::io::Result<Self> {
+        let mut file = fs::File::create(path)?;
+        writeln!(
+            file,
+            "epoch_ms,elapsed_s,issued,ok,shed,timeout,err,bytes_total,fragments,concurrent,peak_concurrent,opened"
+        )?;
+        Ok(Self { file })
+    }
+
+    fn sample(&mut self, m: &Metrics, elapsed: f64) {
+        let epoch_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let _ = writeln!(
+            self.file,
+            "{epoch_ms},{elapsed:.1},{},{},{},{},{},{},{},{},{},{}",
+            m.issued.load(Ordering::Relaxed),
+            m.ok.load(Ordering::Relaxed),
+            m.shed.load(Ordering::Relaxed),
+            m.timeout.load(Ordering::Relaxed),
+            m.err.load(Ordering::Relaxed),
+            m.bytes.load(Ordering::Relaxed),
+            m.fragments.load(Ordering::Relaxed),
+            m.concurrent.load(Ordering::Relaxed),
+            m.peak_concurrent.load(Ordering::Relaxed),
+            m.opened.load(Ordering::Relaxed),
+        );
+        let _ = self.file.flush();
+    }
+}
+
+/// `header` is the mode-specific block (already formatted) printed under the
+/// protocol line, so burst and soak runs can describe themselves differently
+/// without threading both sets of knobs through here.
+fn print_report(stats: &WarpStats, elapsed: f64, header: &str, protocol: &str) {
     let mut lat = stats.latencies_us.clone();
     lat.sort_unstable();
     let avg_bytes = if stats.ok > 0 {
@@ -399,16 +463,14 @@ fn print_report(
 
     println!("\n=== /sync/warp summary ===");
     println!("protocol:    {protocol}");
+    print!("{header}");
     println!(
-        "clients:     {clients} (connected {connected}) | requests/client {requests} | begin hashes {begins} | total {}",
-        clients.saturating_mul(requests)
-    );
-    println!(
-        "issued={} ok={} err={} timeout={} in {elapsed:.1}s => {:.1} ok req/s",
+        "issued={} ok={} shed={} timeout={} err={} in {elapsed:.1}s => {:.1} ok req/s",
         stats.issued,
         stats.ok,
-        stats.err,
+        stats.shed,
         stats.timeout,
+        stats.err,
         stats.ok as f64 / elapsed
     );
     println!(
@@ -460,6 +522,347 @@ fn print_report(
 }
 
 // ---------------------------------------------------------------------------
+// Shared recording
+// ---------------------------------------------------------------------------
+
+/// Fold one settled request into the stats. `idx` is the index of the `begin`
+/// hash used, kept only to label the first sample.
+fn record_response(
+    stats: &mut WarpStats,
+    metrics: &Metrics,
+    response: Result<Vec<u8>, ()>,
+    idx: usize,
+    t0: Instant,
+) {
+    match response {
+        Ok(bytes) => {
+            stats.ok += 1;
+            metrics.ok.fetch_add(1, Ordering::Relaxed);
+            stats.latencies_us.push(t0.elapsed().as_micros() as u64);
+            let len = bytes.len() as u64;
+            stats.bytes_total += len;
+            stats.bytes_max = stats.bytes_max.max(len);
+            metrics.bytes.fetch_add(len, Ordering::Relaxed);
+
+            match warp::summarize_response(&bytes) {
+                Some(s) => {
+                    stats.fragments_total += s.fragments;
+                    metrics.fragments.fetch_add(s.fragments, Ordering::Relaxed);
+                    if s.is_finished {
+                        stats.finished_responses += 1;
+                    }
+                    if stats.sample.is_none() {
+                        stats.sample = Some(format!(
+                            "{} fragments, is_finished={}, {} bytes (begin #{idx})",
+                            s.fragments, s.is_finished, s.len
+                        ));
+                    }
+                }
+                None => stats.unparseable += 1,
+            }
+        }
+        // The node closed the substream without a body. Two very different causes
+        // look identical here: the inbound queue was full and the request was
+        // dropped, or `begin` was refused (not finalized / not canonical /
+        // set-change history incomplete). Only the node's failure counter's
+        // `reason` label separates them — see the module docs.
+        Err(()) => {
+            stats.shed += 1;
+            metrics.shed.fetch_add(1, Ordering::Relaxed);
+            let reason =
+                "no-response: substream closed with no proof (queue-full drop or bad begin)";
+            *stats.errors.entry(reason.to_string()).or_insert(0) += 1;
+            stats.last_err = Some(reason.to_string());
+        }
+    }
+}
+
+fn record_failure(stats: &mut WarpStats, metrics: &Metrics, error: OutboundFailure) {
+    if matches!(error, OutboundFailure::Timeout) {
+        stats.timeout += 1;
+        metrics.timeout.fetch_add(1, Ordering::Relaxed);
+    } else {
+        stats.err += 1;
+        metrics.err.fetch_add(1, Ordering::Relaxed);
+    }
+    let reason = classify_failure(&error);
+    stats.last_err = Some(reason.clone());
+    *stats.errors.entry(reason).or_insert(0) += 1;
+}
+
+// ---------------------------------------------------------------------------
+// Soak mode: open-loop, with connection churn
+// ---------------------------------------------------------------------------
+
+/// Outcome of awaiting the single in-flight request of a soak connection.
+enum Outcome {
+    Responded(Result<Vec<u8>, ()>),
+    Failed(OutboundFailure),
+    /// Deadline reached or the connection closed — retire this connection.
+    Aborted,
+}
+
+/// Wait for this connection's one in-flight request to settle, or give up at the
+/// run deadline / on connection close.
+async fn await_request(swarm: &mut Swarm<SpamBehaviour>, deadline: TokioInstant) -> Outcome {
+    let sleep = tokio::time::sleep_until(deadline);
+    tokio::pin!(sleep);
+    loop {
+        futures::select! {
+            ev = swarm.select_next_some().fuse() => match ev {
+                SwarmEvent::Behaviour(SpamBehaviourEvent::Light(
+                    request_response::Event::Message {
+                        message: RrMessage::Response { response, .. },
+                        ..
+                    },
+                )) => return Outcome::Responded(response),
+                SwarmEvent::Behaviour(SpamBehaviourEvent::Light(
+                    request_response::Event::OutboundFailure { error, .. },
+                )) => return Outcome::Failed(error),
+                SwarmEvent::ConnectionClosed { .. } => return Outcome::Aborted,
+                _ => {}
+            },
+            _ = (&mut sleep).fuse() => return Outcome::Aborted,
+        }
+    }
+}
+
+/// One soak connection: fresh identity, dial, then `lifetime` warp requests one
+/// at a time — each gated on a pacer permit so the aggregate offered rate holds
+/// — then disconnect. A replacement is spawned by the orchestrator, which is what
+/// gives the run realistic churn: real warp-syncers connect, pull some proof, and
+/// leave, often mid-transfer.
+#[allow(clippy::too_many_arguments)]
+async fn run_soak_connection(
+    id: usize,
+    addr: Multiaddr,
+    protocol: String,
+    request_timeout: Duration,
+    begins: Arc<Vec<[u8; 32]>>,
+    lifetime: usize,
+    deadline: TokioInstant,
+    pacer: Arc<tokio::sync::Semaphore>,
+    metrics: Arc<Metrics>,
+) -> WarpStats {
+    let mut stats = WarpStats::default();
+
+    // The orchestrator counted this connection as concurrent at spawn time, so
+    // every exit path has to give that back.
+    let finish = |s: WarpStats, m: &Metrics| {
+        m.concurrent.fetch_sub(1, Ordering::Relaxed);
+        s
+    };
+
+    let mut swarm = match build_swarm(&protocol, request_timeout, 16).await {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("conn {id}: build_swarm failed: {e}");
+            return finish(stats, &metrics);
+        }
+    };
+    if let Err(e) = swarm.dial(addr) {
+        log::error!("conn {id}: dial failed: {e}");
+        return finish(stats, &metrics);
+    }
+
+    let peer = {
+        let sleep = tokio::time::sleep_until(deadline);
+        tokio::pin!(sleep);
+        let mut found = None;
+        loop {
+            futures::select! {
+                ev = swarm.select_next_some().fuse() => match ev {
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        found = Some(peer_id);
+                        break;
+                    }
+                    SwarmEvent::OutgoingConnectionError { error, .. } => {
+                        log::warn!("conn {id}: connection error: {error}");
+                        break;
+                    }
+                    _ => {}
+                },
+                _ = (&mut sleep).fuse() => break,
+            }
+        }
+        match found {
+            Some(p) => p,
+            None => return finish(stats, &metrics),
+        }
+    };
+    metrics.connected.fetch_add(1, Ordering::Relaxed);
+
+    let mut issued = 0usize;
+    while issued < lifetime && TokioInstant::now() < deadline {
+        // Hold the aggregate rate: wait for a permit, or stop at the deadline.
+        tokio::select! {
+            permit = pacer.acquire() => match permit {
+                Ok(p) => p.forget(),
+                Err(_) => break,
+            },
+            _ = tokio::time::sleep_until(deadline) => break,
+        }
+        if TokioInstant::now() >= deadline {
+            break;
+        }
+
+        let idx = issued % begins.len();
+        let payload = warp::encode_request(&begins[idx]);
+        let _ = swarm.behaviour_mut().light.send_request(&peer, payload);
+        issued += 1;
+        stats.issued += 1;
+        metrics.issued.fetch_add(1, Ordering::Relaxed);
+        let t0 = Instant::now();
+
+        match await_request(&mut swarm, deadline).await {
+            Outcome::Responded(r) => record_response(&mut stats, &metrics, r, idx, t0),
+            Outcome::Failed(f) => record_failure(&mut stats, &metrics, f),
+            Outcome::Aborted => break,
+        }
+    }
+
+    finish(stats, &metrics)
+}
+
+/// Drive the open-loop soak: keep a pool of at most `max_concurrent` connections
+/// alive, each living for `lifetime` requests, until `duration` elapses.
+#[allow(clippy::too_many_arguments)]
+async fn run_soak(
+    protocol: String,
+    multiaddr: Multiaddr,
+    begins: Arc<Vec<[u8; 32]>>,
+    rate: u64,
+    duration: Duration,
+    lifetime: usize,
+    max_concurrent: usize,
+    request_timeout: Duration,
+    mut sampler: Option<CsvSampler>,
+) -> WarpStats {
+    let metrics = Arc::new(Metrics::default());
+    let start = Instant::now();
+    let deadline = TokioInstant::now() + duration;
+
+    // Token-bucket pacer, same shape as soak-light: permits accrue at exactly
+    // `rate`/s via a fractional accumulator, and the outstanding pool is capped
+    // at ~50ms of rate so a stalled connection pool cannot bank a backlog and
+    // then burst past the target once it recovers.
+    let pacer = Arc::new(tokio::sync::Semaphore::new(0));
+    let cap = ((rate / 20) as usize).max(1);
+    let pacer_task = {
+        let pacer = pacer.clone();
+        tokio::spawn(async move {
+            let per_tick = rate as f64 * 0.005;
+            let mut acc = 0f64;
+            let mut tick = tokio::time::interval(Duration::from_millis(5));
+            loop {
+                tick.tick().await;
+                if TokioInstant::now() >= deadline {
+                    break;
+                }
+                acc = (acc + per_tick).min(cap as f64);
+                let room = cap.saturating_sub(pacer.available_permits());
+                let add = (acc.floor() as usize).min(room);
+                if add > 0 {
+                    pacer.add_permits(add);
+                    acc -= add as f64;
+                }
+            }
+        })
+    };
+
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut merged = WarpStats::default();
+    let mut opened = 0usize;
+    let mut last_drift = (Instant::now(), 0u64, 0u64, 0u64);
+
+    let final_sleep = tokio::time::sleep_until(deadline);
+    tokio::pin!(final_sleep);
+    let mut manage = tokio::time::interval(Duration::from_millis(100));
+    let mut progress = tokio::time::interval(Duration::from_secs(1));
+    let mut drift = tokio::time::interval(Duration::from_secs(30));
+    manage.tick().await;
+    progress.tick().await;
+    drift.tick().await;
+
+    loop {
+        tokio::select! {
+            _ = &mut final_sleep => break,
+            _ = manage.tick() => {
+                // Top the pool back up to max_concurrent. Replacements are what
+                // produce churn: each retiring connection is replaced by a fresh
+                // identity rather than being recycled.
+                while (metrics.concurrent.load(Ordering::Relaxed) as usize) < max_concurrent {
+                    metrics.bump_concurrent();
+                    metrics.opened.fetch_add(1, Ordering::Relaxed);
+                    tasks.spawn(run_soak_connection(
+                        opened,
+                        multiaddr.clone(),
+                        protocol.clone(),
+                        request_timeout,
+                        begins.clone(),
+                        lifetime,
+                        deadline,
+                        pacer.clone(),
+                        metrics.clone(),
+                    ));
+                    opened += 1;
+                }
+            }
+            // One CSV row per second — the sampling must live here and not at
+            // the bottom of the loop, which also spins on the 100ms manage tick
+            // and on every connection retirement.
+            _ = progress.tick() => {
+                print_soak_progress(&metrics, start, lifetime);
+                if let Some(s) = sampler.as_mut() {
+                    s.sample(&metrics, start.elapsed().as_secs_f64());
+                }
+            }
+            _ = drift.tick() => print_drift(&metrics, &mut last_drift),
+            // Reap finished connections as they retire, so their stats are folded
+            // in incrementally rather than all at the end.
+            Some(joined) = tasks.join_next() => match joined {
+                Ok(stats) => merged.merge(stats),
+                Err(e) => log::error!("soak connection join error: {e}"),
+            },
+        }
+    }
+
+    pacer_task.abort();
+    pacer.close();
+
+    // Drain whatever is still in flight at the deadline.
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(stats) => merged.merge(stats),
+            Err(e) => log::error!("soak connection join error: {e}"),
+        }
+    }
+    println!();
+
+    if let Some(s) = sampler.as_mut() {
+        s.sample(&metrics, start.elapsed().as_secs_f64());
+    }
+
+    let elapsed = start.elapsed().as_secs_f64().max(0.001);
+    let header = format!(
+        "mode:        soak (open loop) | offered rate {rate}/s for {:.0}s\n\
+         conns:       {} opened, peak {} concurrent (cap {max_concurrent}) | {lifetime} req each\n\
+         begins:      {} hash(es)\n",
+        duration.as_secs_f64(),
+        metrics.opened.load(Ordering::Relaxed),
+        metrics.peak_concurrent.load(Ordering::Relaxed),
+        begins.len(),
+    );
+    print_report(&merged, elapsed, &header, &protocol);
+    println!(
+        "offered:     {:.2}/s achieved vs {rate}/s target",
+        merged.issued as f64 / elapsed
+    );
+
+    merged
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -477,6 +880,10 @@ pub async fn warp_sync(
     clients: usize,
     requests: usize,
     stagger_ms: u64,
+    rate: Option<u64>,
+    duration: Duration,
+    max_concurrent: usize,
+    out_dir: Option<PathBuf>,
     request_timeout: Duration,
     timeout: Duration,
 ) -> Result<(), Box<dyn Error>> {
@@ -537,10 +944,6 @@ pub async fn warp_sync(
         }
     };
 
-    println!(
-        "Load:        clients={clients} requests/client={requests} (1 in flight each) => total {} req (req timeout {request_timeout:?})",
-        clients.saturating_mul(requests)
-    );
     if begins.len() == 1 {
         println!(
             "             every request re-sends the same begin, so the node rebuilds \
@@ -550,6 +953,50 @@ pub async fn warp_sync(
 
     let multiaddr: Multiaddr = address.parse()?;
     let begins = Arc::new(begins);
+
+    let mut sampler = None;
+    if let Some(dir) = &out_dir {
+        fs::create_dir_all(dir)?;
+        sampler = Some(CsvSampler::create(&dir.join("warp-samples.csv"))?);
+    }
+
+    // Soak mode: --rate switches from the closed-loop burst to an open-loop run
+    // with connection churn, for questions a 7-second burst cannot answer —
+    // memory retention, buffers left by clients that leave mid-transfer, and
+    // whether sustained warp serving interferes with block import.
+    if let Some(rate) = rate {
+        let rate = rate.max(1);
+        println!(
+            "Soak:        rate={rate}/s duration={:.0}s | up to {max_concurrent} concurrent conns, \
+             {requests} req each then reconnect (req timeout {request_timeout:?})",
+            duration.as_secs_f64()
+        );
+        println!(
+            "             ~{:.1} MiB total at 8 MiB/proof — check that before a long run",
+            rate as f64 * duration.as_secs_f64() * 8.0
+        );
+        run_soak(
+            protocol,
+            multiaddr,
+            begins,
+            rate,
+            duration,
+            requests,
+            max_concurrent.max(1),
+            request_timeout,
+            sampler,
+        )
+        .await;
+        if let Some(dir) = &out_dir {
+            println!("wrote:       {}", dir.join("warp-samples.csv").display());
+        }
+        return Ok(());
+    }
+
+    println!(
+        "Load:        clients={clients} requests/client={requests} (1 in flight each) => total {} req (req timeout {request_timeout:?})",
+        clients.saturating_mul(requests)
+    );
     let metrics = Arc::new(Metrics::default());
     let deadline = tokio::time::Instant::now() + timeout;
     let start = Instant::now();
@@ -603,10 +1050,18 @@ pub async fn warp_sync(
     let results = loop {
         futures::select! {
             r = (&mut joined).fuse() => break r,
-            _ = progress.tick().fuse() => print_progress(&metrics, total, start),
+            _ = progress.tick().fuse() => {
+                print_progress(&metrics, total, start);
+                if let Some(s) = sampler.as_mut() {
+                    s.sample(&metrics, start.elapsed().as_secs_f64());
+                }
+            }
         }
     };
     println!();
+    if let Some(s) = sampler.as_mut() {
+        s.sample(&metrics, start.elapsed().as_secs_f64());
+    }
 
     let mut merged = WarpStats::default();
     for r in results {
@@ -616,15 +1071,23 @@ pub async fn warp_sync(
         }
     }
 
+    let header = format!(
+        "mode:        burst (closed loop)\n\
+         clients:     {clients} (connected {}) | requests/client {requests} | begin hashes {} | total {}\n",
+        metrics.connected.load(Ordering::Relaxed),
+        begins.len(),
+        clients.saturating_mul(requests),
+    );
     print_report(
         &merged,
         start.elapsed().as_secs_f64().max(0.001),
-        clients,
-        metrics.connected.load(Ordering::Relaxed),
-        requests,
-        begins.len(),
+        &header,
         &protocol,
     );
+
+    if let Some(dir) = &out_dir {
+        println!("wrote:       {}", dir.join("warp-samples.csv").display());
+    }
 
     Ok(())
 }
