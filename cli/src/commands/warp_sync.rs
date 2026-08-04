@@ -83,6 +83,8 @@ struct Metrics {
     shed: AtomicU64,
     timeout: AtomicU64,
     err: AtomicU64,
+    /// Issued but abandoned: connection closed or deadline hit while in flight.
+    aborted: AtomicU64,
     bytes: AtomicU64,
     fragments: AtomicU64,
     connected: AtomicU64,
@@ -119,6 +121,9 @@ struct WarpStats {
     shed: u64,
     err: u64,
     timeout: u64,
+    /// Issued, then abandoned without an outcome. Tracked so that
+    /// `ok + shed + err + timeout + aborted == issued` always holds.
+    aborted: u64,
     bytes_total: u64,
     bytes_max: u64,
     fragments_total: u64,
@@ -139,6 +144,7 @@ impl WarpStats {
         self.shed += other.shed;
         self.err += other.err;
         self.timeout += other.timeout;
+        self.aborted += other.aborted;
         self.bytes_total += other.bytes_total;
         self.bytes_max = self.bytes_max.max(other.bytes_max);
         self.fragments_total += other.fragments_total;
@@ -282,6 +288,11 @@ impl WarpClient {
                 _ = (&mut sleep).fuse() => break,
             }
         }
+        // Still in flight when the deadline fired: no outcome will arrive.
+        if self.pending.take().is_some() {
+            self.stats.aborted += 1;
+            self.metrics.aborted.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -371,12 +382,13 @@ fn print_soak_progress(m: &Metrics, start: Instant, lifetime: usize) {
     let opened = m.opened.load(Ordering::Relaxed);
     let elapsed = start.elapsed().as_secs_f64().max(0.001);
     print!(
-        "\r  t={:.0}s conns={concurrent}(peak {peak}, opened {opened}x{lifetime}) | offered {:.1}/s served {:.1}/s shed {:.1}/s | {:.1} MiB/s | ok={ok} shed={shed} timeout={timeout}   ",
+        "\r  t={:.0}s conns={concurrent}(peak {peak}, opened {opened}x{lifetime}) | offered {:.1}/s served {:.1}/s shed {:.1}/s | {:.1} MiB/s | ok={ok} shed={shed} timeout={timeout} aborted={}   ",
         elapsed,
         issued as f64 / elapsed,
         ok as f64 / elapsed,
         shed as f64 / elapsed,
         mib(bytes) / elapsed,
+        m.aborted.load(Ordering::Relaxed),
     );
     let _ = std::io::Write::flush(&mut std::io::stdout());
 }
@@ -416,7 +428,7 @@ impl CsvSampler {
         let mut file = fs::File::create(path)?;
         writeln!(
             file,
-            "epoch_ms,elapsed_s,issued,ok,shed,timeout,err,bytes_total,fragments,concurrent,peak_concurrent,opened"
+            "epoch_ms,elapsed_s,issued,ok,shed,timeout,err,bytes_total,fragments,aborted,concurrent,peak_concurrent,opened"
         )?;
         Ok(Self { file })
     }
@@ -428,7 +440,7 @@ impl CsvSampler {
             .as_millis();
         let _ = writeln!(
             self.file,
-            "{epoch_ms},{elapsed:.1},{},{},{},{},{},{},{},{},{},{}",
+            "{epoch_ms},{elapsed:.1},{},{},{},{},{},{},{},{},{},{},{}",
             m.issued.load(Ordering::Relaxed),
             m.ok.load(Ordering::Relaxed),
             m.shed.load(Ordering::Relaxed),
@@ -436,6 +448,7 @@ impl CsvSampler {
             m.err.load(Ordering::Relaxed),
             m.bytes.load(Ordering::Relaxed),
             m.fragments.load(Ordering::Relaxed),
+            m.aborted.load(Ordering::Relaxed),
             m.concurrent.load(Ordering::Relaxed),
             m.peak_concurrent.load(Ordering::Relaxed),
             m.opened.load(Ordering::Relaxed),
@@ -465,14 +478,23 @@ fn print_report(stats: &WarpStats, elapsed: f64, header: &str, protocol: &str) {
     println!("protocol:    {protocol}");
     print!("{header}");
     println!(
-        "issued={} ok={} shed={} timeout={} err={} in {elapsed:.1}s => {:.1} ok req/s",
+        "issued={} ok={} shed={} timeout={} err={} aborted={} in {elapsed:.1}s => {:.1} ok req/s",
         stats.issued,
         stats.ok,
         stats.shed,
         stats.timeout,
         stats.err,
+        stats.aborted,
         stats.ok as f64 / elapsed
     );
+    let accounted = stats.ok + stats.shed + stats.timeout + stats.err + stats.aborted;
+    if accounted != stats.issued {
+        println!(
+            "  WARNING: {accounted} outcomes for {} issued — accounting gap of {}",
+            stats.issued,
+            stats.issued.abs_diff(accounted)
+        );
+    }
     println!(
         "latency ms:  p50={:.1} p90={:.1} p99={:.1} max={:.1}",
         percentile_ms(&lat, 50),
@@ -627,11 +649,17 @@ async fn await_request(swarm: &mut Swarm<SpamBehaviour>, deadline: TokioInstant)
     }
 }
 
-/// One soak connection: fresh identity, dial, then `lifetime` warp requests one
-/// at a time — each gated on a pacer permit so the aggregate offered rate holds
-/// — then disconnect. A replacement is spawned by the orchestrator, which is what
-/// gives the run realistic churn: real warp-syncers connect, pull some proof, and
-/// leave, often mid-transfer.
+/// One soak connection: fresh identity, dial, then `lifetime` warp requests
+/// **back to back**, then disconnect.
+///
+/// It deliberately does not self-pace between requests. The rate is applied to
+/// connection *arrivals* by the orchestrator, which is both how a real
+/// warp-syncing client behaves — arrive, pull proofs as fast as the link allows,
+/// leave — and the only model that works here: a connection that sits idle is
+/// closed by the node after ~10s, since a request-response substream is not a
+/// keep-alive protocol. Per-request pacing left connections idle for
+/// `max_concurrent / rate` seconds between turns, so at low rates the node reaped
+/// them before their next request and the work was simply lost.
 #[allow(clippy::too_many_arguments)]
 async fn run_soak_connection(
     id: usize,
@@ -641,7 +669,6 @@ async fn run_soak_connection(
     begins: Arc<Vec<[u8; 32]>>,
     lifetime: usize,
     deadline: TokioInstant,
-    pacer: Arc<tokio::sync::Semaphore>,
     metrics: Arc<Metrics>,
 ) -> WarpStats {
     let mut stats = WarpStats::default();
@@ -694,18 +721,6 @@ async fn run_soak_connection(
 
     let mut issued = 0usize;
     while issued < lifetime && TokioInstant::now() < deadline {
-        // Hold the aggregate rate: wait for a permit, or stop at the deadline.
-        tokio::select! {
-            permit = pacer.acquire() => match permit {
-                Ok(p) => p.forget(),
-                Err(_) => break,
-            },
-            _ = tokio::time::sleep_until(deadline) => break,
-        }
-        if TokioInstant::now() >= deadline {
-            break;
-        }
-
         let idx = issued % begins.len();
         let payload = warp::encode_request(&begins[idx]);
         let _ = swarm.behaviour_mut().light.send_request(&peer, payload);
@@ -717,7 +732,13 @@ async fn run_soak_connection(
         match await_request(&mut swarm, deadline).await {
             Outcome::Responded(r) => record_response(&mut stats, &metrics, r, idx, t0),
             Outcome::Failed(f) => record_failure(&mut stats, &metrics, f),
-            Outcome::Aborted => break,
+            // Abandoned in flight — connection closed under us, or the run
+            // ended. Recorded rather than dropped.
+            Outcome::Aborted => {
+                stats.aborted += 1;
+                metrics.aborted.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
         }
     }
 
@@ -742,33 +763,15 @@ async fn run_soak(
     let start = Instant::now();
     let deadline = TokioInstant::now() + duration;
 
-    // Token-bucket pacer, same shape as soak-light: permits accrue at exactly
-    // `rate`/s via a fractional accumulator, and the outstanding pool is capped
-    // at ~50ms of rate so a stalled connection pool cannot bank a backlog and
-    // then burst past the target once it recovers.
-    let pacer = Arc::new(tokio::sync::Semaphore::new(0));
-    let cap = ((rate / 20) as usize).max(1);
-    let pacer_task = {
-        let pacer = pacer.clone();
-        tokio::spawn(async move {
-            let per_tick = rate as f64 * 0.005;
-            let mut acc = 0f64;
-            let mut tick = tokio::time::interval(Duration::from_millis(5));
-            loop {
-                tick.tick().await;
-                if TokioInstant::now() >= deadline {
-                    break;
-                }
-                acc = (acc + per_tick).min(cap as f64);
-                let room = cap.saturating_sub(pacer.available_permits());
-                let add = (acc.floor() as usize).min(room);
-                if add > 0 {
-                    pacer.add_permits(add);
-                    acc -= add as f64;
-                }
-            }
-        })
-    };
+    // Arrivals carry the rate. Each connection performs `lifetime` requests, so
+    // to offer `rate` requests/second we admit rate/lifetime connections per
+    // second, accumulated fractionally on the 100ms manage tick so any rate is
+    // exact. `max_concurrent` only caps the pool; it does not set the pace.
+    let arrivals_per_tick = rate as f64 / lifetime as f64 * 0.1;
+    // Seeded at 1 so the first connection is admitted on the first tick rather
+    // than after a full arrival interval — otherwise a short run loses one whole
+    // connection's worth of requests and reports under the target rate.
+    let mut arrival_acc = 1f64;
 
     let mut tasks = tokio::task::JoinSet::new();
     let mut merged = WarpStats::default();
@@ -788,10 +791,19 @@ async fn run_soak(
         tokio::select! {
             _ = &mut final_sleep => break,
             _ = manage.tick() => {
-                // Top the pool back up to max_concurrent. Replacements are what
-                // produce churn: each retiring connection is replaced by a fresh
-                // identity rather than being recycled.
-                while (metrics.concurrent.load(Ordering::Relaxed) as usize) < max_concurrent {
+                // Admit however many arrivals have accrued, subject to the pool
+                // cap. Each is a fresh identity — retiring connections are
+                // replaced, never recycled, which is what gives the run churn.
+                arrival_acc += arrivals_per_tick;
+                while arrival_acc >= 1.0 {
+                    if (metrics.concurrent.load(Ordering::Relaxed) as usize) >= max_concurrent {
+                        // Pool is saturated: the node cannot keep up with the
+                        // offered rate. Drop the backlog rather than banking it,
+                        // so recovery cannot burst past the target.
+                        arrival_acc = 0.0;
+                        break;
+                    }
+                    arrival_acc -= 1.0;
                     metrics.bump_concurrent();
                     metrics.opened.fetch_add(1, Ordering::Relaxed);
                     tasks.spawn(run_soak_connection(
@@ -802,7 +814,6 @@ async fn run_soak(
                         begins.clone(),
                         lifetime,
                         deadline,
-                        pacer.clone(),
                         metrics.clone(),
                     ));
                     opened += 1;
@@ -826,9 +837,6 @@ async fn run_soak(
             },
         }
     }
-
-    pacer_task.abort();
-    pacer.close();
 
     // Drain whatever is still in flight at the deadline.
     while let Some(joined) = tasks.join_next().await {

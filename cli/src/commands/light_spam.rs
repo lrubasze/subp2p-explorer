@@ -52,6 +52,8 @@ struct Metrics {
     ok: AtomicU64,
     /// Response arrived with no proof — the node could not serve it.
     unserved: AtomicU64,
+    /// Issued but abandoned: still in flight when the run deadline fired.
+    aborted: AtomicU64,
     err: AtomicU64,
     timeout: AtomicU64,
     in_flight: AtomicU64,
@@ -262,6 +264,16 @@ impl LightSpammer {
                 _ = (&mut sleep).fuse() => break,
             }
         }
+        self.abort_pending();
+    }
+
+    /// Anything still in flight when the deadline fires never gets an outcome.
+    /// Book it as aborted so the buckets sum to `issued`.
+    fn abort_pending(&mut self) {
+        for (idx, _) in std::mem::take(&mut self.pending).into_values() {
+            self.stats[idx].aborted += 1;
+            self.metrics.aborted.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn into_report(self) -> WorkerReport {
@@ -291,6 +303,7 @@ fn merge_reports(
             m.issued += s.issued;
             m.ok += s.ok;
             m.unserved += s.unserved;
+            m.aborted += s.aborted;
             m.err += s.err;
             m.timeout += s.timeout;
             m.proof_bytes_total += s.proof_bytes_total;
@@ -339,10 +352,12 @@ fn print_report(
     light_protocol: &str,
 ) {
     let mut all: Vec<u64> = Vec::new();
-    let (mut ok, mut unserved, mut err, mut timeout, mut proof) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut ok, mut unserved, mut aborted, mut err, mut timeout, mut proof) =
+        (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     for s in stats {
         ok += s.ok;
         unserved += s.unserved;
+        aborted += s.aborted;
         err += s.err;
         timeout += s.timeout;
         proof += s.proof_bytes_total;
@@ -357,9 +372,16 @@ fn print_report(
         connections.saturating_mul(count)
     );
     println!(
-        "issued={issued} ok={ok} unserved={unserved} err={err} timeout={timeout} in {elapsed:.1}s => {:.0} ok req/s",
+        "issued={issued} ok={ok} unserved={unserved} err={err} timeout={timeout} aborted={aborted} in {elapsed:.1}s => {:.0} ok req/s",
         ok as f64 / elapsed
     );
+    let accounted = ok + unserved + err + timeout + aborted;
+    if accounted != issued as u64 {
+        println!(
+            "  WARNING: {accounted} outcomes for {issued} issued — accounting gap of {}",
+            (issued as u64).abs_diff(accounted)
+        );
+    }
     if unserved > 0 {
         println!("  note: {unserved} response(s) carried no proof: the node answered but could");
         println!("        not serve the request — runtime method absent on this chain, or a");

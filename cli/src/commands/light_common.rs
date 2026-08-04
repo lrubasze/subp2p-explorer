@@ -563,6 +563,11 @@ pub(crate) struct MethodStats {
     /// Latencies of the `unserved` responses — a useful control, since it is the
     /// round-trip cost with the proving work removed.
     pub unserved_us: Vec<u64>,
+    /// Issued, then abandoned without an outcome: the connection closed or the
+    /// run deadline fired while the request was in flight. Tracked so that
+    /// `ok + unserved + err + timeout + aborted == issued` always holds — without
+    /// it these vanish silently and a broken run looks merely quiet.
+    pub aborted: u64,
     pub sample: Option<String>,
     pub last_err: Option<String>,
 }
@@ -643,6 +648,12 @@ pub(crate) fn merge_error_map(into: &mut HashMap<String, u64>, from: HashMap<Str
 /// Mirrors the transport stack of `crate::utils::build_swarm` (TCP + DNS +
 /// WebSocket + noise + yamux); the wss upgrade is required to reach
 /// `*.polkadot.io` hosts on :443.
+/// How long we keep a connection with no open substream. Must comfortably exceed
+/// the longest gap between a connection's requests: in an open-loop soak that is
+/// the wait for a rate-limiter permit, which at a low `--rate` and a full
+/// connection pool can be tens of seconds.
+const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(300);
+
 pub(crate) async fn build_swarm(
     light_protocol: &str,
     request_timeout: Duration,
@@ -674,6 +685,13 @@ pub(crate) async fn build_swarm(
             SpamBehaviour { identify, light }
         })
         .expect("Can construct behaviour; qed")
+        // libp2p's default idle_connection_timeout is 0: a connection with no
+        // open substream is closed at once. The closed-loop commands never
+        // noticed, because they always have a request in flight — but an
+        // open-loop soak connection sits idle between requests while it waits
+        // for its rate-limiter permit, and was being reaped by our own swarm
+        // mid-run. `hold_peers` sets this explicitly for the same reason.
+        .with_swarm_config(|c| c.with_idle_connection_timeout(IDLE_CONNECTION_TIMEOUT))
         .build();
 
     Ok(swarm)

@@ -48,6 +48,8 @@ struct SoakMetrics {
     ok: AtomicU64,
     /// Response arrived with no proof — the node could not serve it.
     unserved: AtomicU64,
+    /// Issued but abandoned: connection closed or deadline hit while in flight.
+    aborted: AtomicU64,
     /// `Err(())` — node closed the substream with no response (load-shedding).
     shed: AtomicU64,
     timeout: AtomicU64,
@@ -255,7 +257,13 @@ async fn run_connection(
                 st.last_err = Some(reason.clone());
                 *report.errors.entry(reason).or_insert(0) += 1;
             }
-            Outcome::Aborted => break,
+            // Abandoned in flight. Recorded rather than dropped, so the
+            // buckets always sum to `issued`.
+            Outcome::Aborted => {
+                st.aborted += 1;
+                metrics.aborted.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
         }
     }
 
@@ -316,10 +324,12 @@ fn print_report(
     light_protocol: &str,
 ) {
     let mut all: Vec<u64> = Vec::new();
-    let (mut ok, mut unserved, mut timeout, mut proof) = (0u64, 0u64, 0u64, 0u64);
+    let (mut ok, mut unserved, mut aborted, mut timeout, mut proof) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
     for s in stats {
         ok += s.ok;
         unserved += s.unserved;
+        aborted += s.aborted;
         timeout += s.timeout;
         proof += s.proof_bytes_total;
         all.extend_from_slice(&s.latencies_us);
@@ -347,8 +357,15 @@ fn print_report(
         shed as f64 / elapsed,
     );
     println!(
-        "requests:   ok={ok} unserved={unserved} shed={shed} timeout={timeout} other_err={other_err}"
+        "requests:   ok={ok} unserved={unserved} shed={shed} timeout={timeout} other_err={other_err} aborted={aborted}"
     );
+    let accounted = ok + unserved + shed + timeout + other_err + aborted;
+    if accounted != issued as u64 {
+        println!(
+            "  WARNING: {accounted} outcomes for {issued} issued — accounting gap of {}",
+            (issued as u64).abs_diff(accounted)
+        );
+    }
     if unserved > 0 {
         println!("  note: {unserved} response(s) carried no proof: the node answered but could");
         println!("        not serve the request — runtime method absent on this chain, or a");
@@ -616,6 +633,7 @@ pub async fn soak_light(
             m.issued += s.issued;
             m.ok += s.ok;
             m.unserved += s.unserved;
+            m.aborted += s.aborted;
             m.err += s.err;
             m.timeout += s.timeout;
             m.proof_bytes_total += s.proof_bytes_total;
