@@ -10,7 +10,11 @@ ADDRESS=/ip4/195.154.218.123/tcp/30333
 #ADDRESS=/dns4/paseo-asset-hub-next-collator-node-0.parity-testnet.parity.io/tcp/443/wss
 
 #METHOD="account_nonce"
-METHOD="account_nonce,ParachainHost_candidate_events,ParachainHost_disputes,ParachainHost_validators,BabeApi_current_epoch,GrandpaApi_grandpa_authorities,Metadata_metadata"
+#METHOD="warp_code"
+#METHOD="account_nonce,ParachainHost_candidate_events,ParachainHost_disputes,ParachainHost_validators,BabeApi_current_epoch,GrandpaApi_grandpa_authorities,Metadata_metadata"
+# warp sync calls
+#METHOD="babe_configuration,babe_current_epoch,babe_next_epoch,aura_slot_duration,aura_authorities"
+METHOD="babe_configuration,babe_current_epoch,babe_next_epoch"
 
 DURATION=${DURATION:-120}
 # counts per connection
