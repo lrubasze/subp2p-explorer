@@ -1,0 +1,145 @@
+#!/bin/bash
+
+# How far did the node fall behind the chain during a run?
+#
+#   ./chain-deficit results/light-2000-r1 [more run dirs...]
+#   ./chain-deficit results/*/            # everything with a node.csv
+#
+# Writes `chain.txt` into each run directory and prints one line per run.
+# `make-report` reads those files, so run this before rebuilding the report.
+#
+# THE METRIC. For the block range the node imported during a run, compare how
+# long the node took (wall clock) against how long the chain took to author those
+# same blocks (on-chain timestamps):
+#
+#     deficit = wall_ms - chain_ms
+#
+# Positive means the node lost ground, ~0 means it kept pace, negative means it
+# caught up. No anchor, no assumed block time.
+#
+# WHY NOT THE OLD FORMULA. Until 4 Aug 2026 this repo used
+#
+#     lag(t) = (34652020 + (t - 1785756960)/6 - best(t)) * 6
+#
+# which extrapolates from a fixed 6.0s block time and charges any deviation to
+# the node. Kusama does not hold 6.0s: windows measured the same day ran at 6.00,
+# 6.12, 6.50 and 6.80 s/block. At 6.5 s/block that formula invents ~26s of "lag"
+# over a 300s run -- larger than the whole spread it was being used to interpret.
+# Re-analysed with the deficit, the 17-run peer campaign separates cleanly
+# (everything <=3500 peers in -12.9..+1.3s, everything >=4250 in +7.1..+138.4s)
+# where the old metric had those groups overlapping.
+#
+# WHY BLOCK BODIES AND NOT STATE. The obvious source for a block's timestamp is
+# the Timestamp pallet's `Now` storage value, but this node prunes state (~256
+# blocks) and anything older returns "State already discarded". Block bodies are
+# kept, so we decode the timestamp inherent (extrinsic 0) instead. Mind the error
+# path: `state_getStorage`'s failure message *contains the block hash*, so a
+# naive `grep -o '0x[0-9a-f]*'` silently yields a 32-byte hash where a timestamp
+# was expected.
+#
+# Timestamps are cached in $RESULTS/.chain-ts, so re-runs need no RPC.
+#
+# FULL=1 fetches every block in each run's range, not just the endpoints. That is
+# what `make-report` needs to draw a deficit-over-time trace; ~50 blocks per run
+# instead of 2, so do it once and let the cache carry it.
+
+set -u
+
+HOST=${HOST:-dev-machine2}
+RPC=${RPC:-http://127.0.0.1:9944}
+RESULTS=${RESULTS:-results}
+CACHE=${CACHE:-$RESULTS/.chain-ts}
+FULL=${FULL:-}
+
+[ $# -gt 0 ] || { echo "usage: $0 <run-dir> [run-dir...]" >&2; exit 1; }
+
+dirs=()
+for d in "$@"; do
+    d=${d%/}
+    [ -f "$d/node.csv" ] && dirs+=("$d")
+done
+if [ ${#dirs[@]} -eq 0 ]; then
+    echo "no run directories with a node.csv" >&2
+    exit 1
+fi
+
+# First and last imported block, and the wall-clock span between those samples.
+# Skips the header and the first data row, matching the awk used elsewhere.
+window() {
+    awk -F, 'NR>2 { if (k==0) { b0=$7; t0=$1 } bN=$7; tN=$1; k++ }
+             END { if (k>0) printf "%d %d %d\n", b0, bN, tN-t0 }' "$1/node.csv"
+}
+
+mkdir -p "$(dirname "$CACHE")"
+touch "$CACHE"
+
+# Every block we still need a timestamp for.
+need=$(
+    for d in "${dirs[@]}"; do
+        read -r b0 bN _ < <(window "$d") || continue
+        if [ -n "$FULL" ]; then
+            seq "$b0" "$bN"
+        else
+            printf '%s\n%s\n' "$b0" "$bN"
+        fi
+    done | sort -un | while read -r b; do
+        grep -q "^$b " "$CACHE" || echo "$b"
+    done
+)
+
+if [ -n "$need" ]; then
+    echo "fetching $(echo "$need" | wc -l) block timestamp(s) from $HOST..." >&2
+    # Remote side prints "<block> <extrinsic-0 hex>"; the first extrinsic is the
+    # timestamp inherent. Extracting it with grep avoids a JSON parser over ssh.
+    {
+        echo "RPC='$RPC'"
+        echo "for b in $(echo "$need" | tr '\n' ' '); do"
+        echo '    req() { curl -s -H "Content-Type: application/json" -d "$1" "$RPC"; }'
+        echo '    h=$(req "{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"chain_getBlockHash\",\"params\":[$b]}" | grep -o "0x[0-9a-f]*")'
+        echo '    x=$(req "{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"chain_getBlock\",\"params\":[\"$h\"]}" \'
+        echo '        | grep -o "\"extrinsics\":\[\"0x[0-9a-f]*" | grep -o "0x[0-9a-f]*")'
+        echo '    [ -n "$x" ] && echo "$b $x"'
+        echo "done"
+    } | ssh "$HOST" bash -s | python3 -c '
+import sys
+
+def moment(h):
+    """Decode the Compact<u64> moment out of a timestamp inherent."""
+    d = bytes.fromhex(h[2:])
+    # Big-integer mode: the marker byte has its low 2 bits set and encodes
+    # (len-4) above them. Locating it by requiring the remaining byte count to
+    # match avoids hardcoding the pallet and call indices.
+    for i in range(len(d)):
+        if d[i] & 3 == 3 and (d[i] >> 2) + 4 == len(d) - i - 1:
+            return int.from_bytes(d[i + 1:], "little")
+    return None
+
+for line in sys.stdin:
+    parts = line.split()
+    if len(parts) == 2 and parts[1].startswith("0x"):
+        ms = moment(parts[1])
+        if ms:
+            print(parts[0], ms)
+' >> "$CACHE"
+fi
+
+ts() { awk -v b="$1" '$1 == b { print $2; exit }' "$CACHE"; }
+
+printf '%-22s %7s %9s %9s %11s\n' run blocks wall_s chain_s deficit_s
+for d in "${dirs[@]}"; do
+    read -r b0 bN wall < <(window "$d") || continue
+    t0=$(ts "$b0")
+    t1=$(ts "$bN")
+    if [ -z "$t0" ] || [ -z "$t1" ]; then
+        printf '%-22s %7s %9s %9s %11s\n' "$(basename "$d")" "?" "?" "?" "no-timestamp"
+        continue
+    fi
+    chain=$((t1 - t0))
+    awk -v n="$(basename "$d")" -v blks=$((bN - b0)) -v w="$wall" -v c="$chain" -v out="$d/chain.txt" '
+        BEGIN {
+            printf "%-22s %7d %9.1f %9.1f %+11.1f\n", n, blks, w/1000, c/1000, (w-c)/1000
+        }'
+    printf 'b0=%d\nbN=%d\nblocks=%d\nwall_ms=%d\nchain_ms=%d\ndeficit_s=%.1f\n' \
+        "$b0" "$bN" $((bN - b0)) "$wall" "$chain" \
+        "$(awk -v w="$wall" -v c="$chain" 'BEGIN { print (w-c)/1000 }')" > "$d/chain.txt"
+done

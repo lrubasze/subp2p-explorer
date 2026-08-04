@@ -341,7 +341,7 @@
     </p>
     <figure class="chart-host" id="host-knee">
       <svg id="chart-knee" viewBox="0 0 940 380" role="img"
-           aria-label="Lag growth against peer count. Flat near zero up to 3500 peers, rising at 4250, and reaching 150 seconds at 5000."></svg>
+           aria-label="Chain deficit against peer count. At or below zero up to 3500 peers, rising at 4250, and reaching 138 seconds at 5000."></svg>
       <div class="tip" id="tip-knee"></div>
     </figure>
   </section>
@@ -364,13 +364,12 @@
   <section class="card">
     <h2>The stall, as it happened</h2>
     <p class="note">
-      Lag against the chain tip over the course of four representative runs, each starting from
-      its own baseline. At 2000 and 3500 the traces stay flat. The two 5000-peer runs both climb;
+      Chain deficit over the course of four representative runs, each starting from zero. At 2000 and 3500 the traces stay flat. The two 5000-peer runs both climb;
       one of them simply stops importing for the last 130 seconds.
     </p>
     <figure class="chart-host" id="host-series">
       <svg id="chart-series" viewBox="0 0 940 360" role="img"
-           aria-label="Lag over time for four runs. The 2000 and 3500 peer runs stay flat; both 5000 peer runs climb, one steeply."></svg>
+           aria-label="Chain deficit over time for four runs. The 2000 and 3500 peer runs stay flat; both 5000 peer runs climb, one steeply."></svg>
       <div class="tip" id="tip-series"></div>
     </figure>
     <div class="legend" id="legend-series"></div>
@@ -408,7 +407,7 @@
   <section class="card">
     <h2>Every run</h2>
     <p class="note">
-      Lag growth is the decision column; runs past the knee are marked. Coverage was 100% and
+      Chain deficit is the decision column; runs past the knee are marked. Coverage was 100% and
       refusals were zero in all 17 runs, so neither column is repeated here.
     </p>
     <div class="table-scroll">
@@ -417,7 +416,7 @@
           <tr>
             <th scope="col">Run</th>
             <th scope="col">Peers held</th>
-            <th scope="col">Lag growth</th>
+            <th scope="col">Chain deficit</th>
             <th scope="col">Spread p50</th>
             <th scope="col">Spread max</th>
             <th scope="col">CPU avg</th>
@@ -434,9 +433,11 @@
     16 cores, 125&nbsp;GB) driven by <code>subp2p-explorer</code>'s <code>hold-peers</code>.
     Each run holds N fake light peers for 300&nbsp;s after a 10&nbsp;ms-per-peer ramp. Node-side
     samples come from the node's own Prometheus endpoint every 5&nbsp;s; task busy fractions from
-    <code>substrate_tasks_polling_duration</code> deltas. Lag is derived against a 6.0&nbsp;s
-    block time anchored on verified on-chain timestamps, and is reported as growth within a run
-    to cancel anchor drift.
+    <code>substrate_tasks_polling_duration</code> deltas. Chain deficit is wall-clock time minus the
+    on-chain time spanned by the blocks the node imported, so it needs no assumed block time:
+    positive means the node lost ground, zero means it kept pace. It replaces an earlier metric
+    that assumed 6.0&nbsp;s blocks and so charged Kusama's own variation (6.00&ndash;6.80&nbsp;s
+    across measured windows) to the node.
   </footer>
 
 </div>
@@ -539,28 +540,28 @@
       svg.appendChild(bl);
 
       frame(svg, b, [0, 1000, 2000, 3000, 4000, 5000], niceTicks(ymin, ymax, 5),
-        'light peers held', 'lag growth (s)', (v) => v.toLocaleString(), (v) => v + 's');
+        'light peers held', 'chain deficit (s)', (v) => v.toLocaleString(), (v) => v + 's');
 
       D.runs.forEach((r) => {
         const c = el('circle', {
-          cx: b.x(r.peers), cy: b.y(r.lag), r: 6.5,
+          cx: b.x(r.peers), cy: b.y(r.deficit), r: 6.5,
           fill: css('--s1'), stroke: css('--surface'), 'stroke-width': 2
         });
         c.addEventListener('mouseenter', (e) => tip.show(e,
-          '<b>' + r.run + '</b><br>lag growth ' + (r.lag > 0 ? '+' : '') + r.lag + 's<br>' +
+          '<b>' + r.run + '</b><br>chain deficit ' + (r.deficit > 0 ? '+' : '') + r.deficit + 's<br>' +
           r.held.toLocaleString() + ' held &middot; CPU ' + r.cpu + '%'));
         c.addEventListener('mousemove', (e) => tip.show(e,
-          '<b>' + r.run + '</b><br>lag growth ' + (r.lag > 0 ? '+' : '') + r.lag + 's<br>' +
+          '<b>' + r.run + '</b><br>chain deficit ' + (r.deficit > 0 ? '+' : '') + r.deficit + 's<br>' +
           r.held.toLocaleString() + ' held &middot; CPU ' + r.cpu + '%'));
         c.addEventListener('mouseleave', tip.hide);
         svg.appendChild(c);
       });
 
-      const worst = D.runs.reduce((a, r) => (r.lag > a.lag ? r : a), D.runs[0]);
+      const worst = D.runs.reduce((a, r) => (r.deficit > a.deficit ? r : a), D.runs[0]);
       const lab = el('text', {
-        x: b.x(worst.peers) - 12, y: b.y(worst.lag) + 4, class: 'mark-label', 'text-anchor': 'end'
+        x: b.x(worst.peers) - 12, y: b.y(worst.deficit) + 4, class: 'mark-label', 'text-anchor': 'end'
       });
-      lab.textContent = '+' + worst.lag + 's — 130 s with no import';
+      lab.textContent = '+' + worst.deficit + 's — 130 s with no import';
       svg.appendChild(lab);
     })();
 
@@ -615,7 +616,7 @@
       svg.appendChild(yt);
     })();
 
-    /* ---------- 3. lag time series ---------- */
+    /* ---------- 3. chain-deficit time series ---------- */
     (function () {
       const svg = document.getElementById('chart-series');
       const tip = tipFor('host-series', 'tip-series');
@@ -633,7 +634,7 @@
       b.y = (v) => b.t + b.h - ((v - ymin) / (ymax - ymin)) * b.h;
 
       frame(svg, b, niceTicks(0, tmax, 6), niceTicks(ymin, ymax, 5),
-        'seconds into run', 'lag vs start (s)', (v) => v + 's', (v) => v + 's');
+        'seconds into run', 'chain deficit (s)', (v) => v + 's', (v) => v + 's');
 
       const legend = document.getElementById('legend-series');
       keys.forEach((k, i) => {
@@ -724,7 +725,7 @@
         tr.innerHTML =
           '<td>' + r.run.replace('light-', '') + '</td>' +
           '<td>' + r.held.toLocaleString() + '</td>' +
-          '<td class="' + (degraded ? 'flag' : '') + '">' + (r.lag > 0 ? '+' : '') + r.lag.toFixed(1) + ' s</td>' +
+          '<td class="' + (degraded ? 'flag' : '') + '">' + (r.deficit > 0 ? '+' : '') + r.deficit.toFixed(1) + ' s</td>' +
           '<td>' + r.spread50.toFixed(1) + ' ms</td>' +
           '<td>' + r.spreadMax.toFixed(1) + ' ms</td>' +
           '<td>' + r.cpu.toFixed(1) + '%</td>' +
