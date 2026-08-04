@@ -21,8 +21,8 @@
 use crate::commands::authorities::fetch_genesis_hash;
 use crate::commands::light_common::{
     build_swarm, classify_failure, head_source, merge_error_map, parse_method_spec, percentile_ms,
-    print_dotns_derivation, record_light_response, Chain, Head, MethodKind, MethodStats,
-    SpamBehaviour, SpamBehaviourEvent,
+    print_dotns_derivation, record_light_response, record_light_shed, Chain, Head, MethodKind,
+    MethodStats, SpamBehaviour, SpamBehaviourEvent,
 };
 use futures::{future::join_all, FutureExt, StreamExt};
 use jsonrpsee::client_transport::ws::Url;
@@ -237,13 +237,10 @@ async fn run_connection(
                     metrics.unserved.fetch_add(1, Ordering::Relaxed);
                 }
             }
+            // Substream closed without a byte: the node refused or dropped it.
             Outcome::Responded(Err(())) => {
-                st.err += 1;
+                record_light_shed(st, &mut report.errors);
                 metrics.shed.fetch_add(1, Ordering::Relaxed);
-                *report
-                    .errors
-                    .entry("no-response: peer closed substream (no proof)".to_string())
-                    .or_insert(0) += 1;
             }
             Outcome::Failed(f) => {
                 if matches!(f, OutboundFailure::Timeout) {
@@ -334,13 +331,10 @@ fn print_report(
         proof += s.proof_bytes_total;
         all.extend_from_slice(&s.latencies_us);
     }
-    // shed is the no-response bucket; other_err is the rest of `err`.
-    let shed = errors
-        .get("no-response: peer closed substream (no proof)")
-        .copied()
-        .unwrap_or(0);
-    let err_total: u64 = stats.iter().map(|s| s.err).sum();
-    let other_err = err_total.saturating_sub(shed);
+    // `shed` and `err` are now distinct fields, so no need to reverse-engineer
+    // one from the error map.
+    let shed: u64 = stats.iter().map(|s| s.shed).sum();
+    let err: u64 = stats.iter().map(|s| s.err).sum();
     all.sort_unstable();
     setups.sort_unstable();
 
@@ -357,9 +351,9 @@ fn print_report(
         shed as f64 / elapsed,
     );
     println!(
-        "requests:   ok={ok} unserved={unserved} shed={shed} timeout={timeout} other_err={other_err} aborted={aborted}"
+        "requests:   ok={ok} unserved={unserved} shed={shed} timeout={timeout} err={err} aborted={aborted}"
     );
-    let accounted = ok + unserved + shed + timeout + other_err + aborted;
+    let accounted = ok + unserved + shed + timeout + err + aborted;
     if accounted != issued as u64 {
         println!(
             "  WARNING: {accounted} outcomes for {issued} issued — accounting gap of {}",
@@ -404,7 +398,7 @@ fn print_report(
             0
         };
         println!(
-            "  {label}: issued={} ok={}{} err={} timeout={} | {} | avg proof={}B{}",
+            "  {label}: issued={} ok={}{} shed={} timeout={} err={} | {} | avg proof={}B{}",
             s.issued,
             s.ok,
             if s.unserved > 0 {
@@ -418,8 +412,9 @@ fn print_report(
             } else {
                 String::new()
             },
-            s.err,
+            s.shed,
             s.timeout,
+            s.err,
             if s.ok > 0 {
                 format!(
                     "p50={:.1}ms p99={:.1}ms",
@@ -634,6 +629,7 @@ pub async fn soak_light(
             m.ok += s.ok;
             m.unserved += s.unserved;
             m.aborted += s.aborted;
+            m.shed += s.shed;
             m.err += s.err;
             m.timeout += s.timeout;
             m.proof_bytes_total += s.proof_bytes_total;

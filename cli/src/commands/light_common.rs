@@ -547,6 +547,11 @@ pub(crate) struct MethodStats {
     pub issued: u64,
     /// A response that actually carried a proof.
     pub ok: u64,
+    /// The node closed the substream without writing a single byte. Distinct from
+    /// `unserved` (a valid, complete response that simply carries no proof) and
+    /// from `err` (which is reserved for transport trouble): this is the node
+    /// actively refusing or dropping the request, i.e. the load-shedding signal.
+    pub shed: u64,
     /// A response arrived, but with no proof: the node could not serve the
     /// request. `RemoteCallResponse { proof: None }` is what substrate replies
     /// with when the runtime call fails — an unknown runtime method, a pruned
@@ -556,6 +561,8 @@ pub(crate) struct MethodStats {
     /// did answer. Its latency is tracked separately too: an unserved call skips
     /// execution, so folding it into `latencies_us` would flatter the numbers.
     pub unserved: u64,
+    /// Transport failure only: dial failure, connection closed, io error. A
+    /// refusal by the node is `shed`, not this.
     pub err: u64,
     pub timeout: u64,
     pub proof_bytes_total: u64,
@@ -607,6 +614,18 @@ pub(crate) fn record_light_response(
             Some(format!("undecodable response body: {e}"))
         }
     }
+}
+
+/// The reason key used for a shed request, shared so the two light commands
+/// bucket it identically.
+pub(crate) const SHED_REASON: &str = "shed: node closed the substream with no proof";
+
+/// Record a shed request: the node closed the substream without writing anything
+/// (`Err(())` from [`light::LightCodec`], mirroring substrate's `GenericCodec`).
+pub(crate) fn record_light_shed(st: &mut MethodStats, errors: &mut HashMap<String, u64>) {
+    st.shed += 1;
+    st.last_err = Some(SHED_REASON.to_string());
+    *errors.entry(SHED_REASON.to_string()).or_insert(0) += 1;
 }
 
 /// Classify an [`OutboundFailure`] into a stable, human-readable bucket key.

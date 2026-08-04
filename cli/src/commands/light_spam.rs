@@ -21,8 +21,8 @@
 use crate::commands::authorities::fetch_genesis_hash;
 use crate::commands::light_common::{
     build_swarm, classify_failure, head_source, merge_error_map, parse_method_spec, percentile_ms,
-    print_dotns_derivation, record_light_response, Chain, Head, MethodKind, MethodStats,
-    SpamBehaviour, SpamBehaviourEvent,
+    print_dotns_derivation, record_light_response, record_light_shed, Chain, Head, MethodKind,
+    MethodStats, SpamBehaviour, SpamBehaviourEvent,
 };
 use futures::{future::join_all, FutureExt, StreamExt};
 use jsonrpsee::client_transport::ws::Url;
@@ -54,6 +54,8 @@ struct Metrics {
     unserved: AtomicU64,
     /// Issued but abandoned: still in flight when the run deadline fired.
     aborted: AtomicU64,
+    /// Node closed the substream with no proof — the load-shedding signal.
+    shed: AtomicU64,
     err: AtomicU64,
     timeout: AtomicU64,
     in_flight: AtomicU64,
@@ -148,14 +150,10 @@ impl LightSpammer {
                     self.metrics.unserved.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            // Substream closed without a response (node couldn't/declined).
+            // Substream closed without a byte: the node refused or dropped it.
             Err(()) => {
-                st.err += 1;
-                self.metrics.err.fetch_add(1, Ordering::Relaxed);
-                *self
-                    .errors
-                    .entry("no-response: peer closed substream (no proof)".to_string())
-                    .or_insert(0) += 1;
+                record_light_shed(st, &mut self.errors);
+                self.metrics.shed.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -304,6 +302,7 @@ fn merge_reports(
             m.ok += s.ok;
             m.unserved += s.unserved;
             m.aborted += s.aborted;
+            m.shed += s.shed;
             m.err += s.err;
             m.timeout += s.timeout;
             m.proof_bytes_total += s.proof_bytes_total;
@@ -325,13 +324,14 @@ fn print_progress(m: &Metrics, total: usize, start: Instant) {
     let issued = m.issued.load(Ordering::Relaxed);
     let ok = m.ok.load(Ordering::Relaxed);
     let unserved = m.unserved.load(Ordering::Relaxed);
+    let shed = m.shed.load(Ordering::Relaxed);
     let err = m.err.load(Ordering::Relaxed);
     let timeout = m.timeout.load(Ordering::Relaxed);
     let in_flight = m.in_flight.load(Ordering::Relaxed);
     let connected = m.connected.load(Ordering::Relaxed);
     let elapsed = start.elapsed().as_secs_f64().max(0.001);
     print!(
-        "\r  issued={issued}/{total} conns={connected} in_flight={in_flight} ok={ok} unserved={unserved} err={err} timeout={timeout} | {:.0} req/s | {:.0}s   ",
+        "\r  issued={issued}/{total} conns={connected} in_flight={in_flight} ok={ok} unserved={unserved} shed={shed} timeout={timeout} err={err} | {:.0} req/s | {:.0}s   ",
         ok as f64 / elapsed,
         elapsed
     );
@@ -352,12 +352,13 @@ fn print_report(
     light_protocol: &str,
 ) {
     let mut all: Vec<u64> = Vec::new();
-    let (mut ok, mut unserved, mut aborted, mut err, mut timeout, mut proof) =
-        (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut ok, mut unserved, mut shed, mut aborted, mut err, mut timeout, mut proof) =
+        (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     for s in stats {
         ok += s.ok;
         unserved += s.unserved;
         aborted += s.aborted;
+        shed += s.shed;
         err += s.err;
         timeout += s.timeout;
         proof += s.proof_bytes_total;
@@ -372,10 +373,10 @@ fn print_report(
         connections.saturating_mul(count)
     );
     println!(
-        "issued={issued} ok={ok} unserved={unserved} err={err} timeout={timeout} aborted={aborted} in {elapsed:.1}s => {:.0} ok req/s",
+        "issued={issued} ok={ok} unserved={unserved} shed={shed} timeout={timeout} err={err} aborted={aborted} in {elapsed:.1}s => {:.0} ok req/s",
         ok as f64 / elapsed
     );
-    let accounted = ok + unserved + err + timeout + aborted;
+    let accounted = ok + unserved + shed + timeout + err + aborted;
     if accounted != issued as u64 {
         println!(
             "  WARNING: {accounted} outcomes for {issued} issued — accounting gap of {}",
@@ -436,11 +437,12 @@ fn print_report(
             "p50=n/a p99=n/a".to_string()
         };
         println!(
-            "  {label}: issued={} ok={}{unserved_note} err={} timeout={} | {served_lat} | avg proof={}B{}{}",
+            "  {label}: issued={} ok={}{unserved_note} shed={} timeout={} err={} | {served_lat} | avg proof={}B{}{}",
             s.issued,
             s.ok,
-            s.err,
+            s.shed,
             s.timeout,
+            s.err,
             avg_proof,
             s.sample
                 .as_ref()
