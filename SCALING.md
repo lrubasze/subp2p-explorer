@@ -67,6 +67,28 @@ METHOD="babe_configuration,babe_current_epoch,babe_next_epoch,aura_slot_duration
   RATE=20000 DURATION=60 CLIENTS=10 ./run-soak-light
 ```
 
+The mixed run below needs the holders remote and the serving legs on loopback, so it
+is two hosts at once. Holders own the monitor and `node.csv`; the legs write nothing
+(their summaries go to the logs), which sidesteps the fact that both `run-hold-peers`
+and `run-warp-sync` would otherwise each start their own `run-monitor-node`.
+
+```sh
+# on the client box
+OUT_DIR=results/mix-1 PEERS=2000 DURATION=300 ./run-hold-peers &
+sleep 30
+
+# on dev-machine2, all three concurrently, 270s
+B="--url ws://127.0.0.1:9944 --address /ip4/127.0.0.1/tcp/30333"
+subp2p-explorer-cli soak-light $B --method "babe_configuration,babe_current_epoch,babe_next_epoch" \
+  --rate 2000 --clients 200 --duration 270 &
+subp2p-explorer-cli soak-light $B --method warp_code --rate 345 --clients 200 --duration 270 &
+subp2p-explorer-cli warp-sync $B --requests 1 --begin-block 0 --step 0 \
+  --request-timeout 20 --rate 13 --duration 270 --max-concurrent 20 &
+wait
+```
+
+Then `./chain-deficit results/mix-1` for the verdict.
+
 ## Traps
 
 - **`soak-light --clients` is a concurrency cap**, not a total. One request in
@@ -78,17 +100,46 @@ METHOD="babe_configuration,babe_current_epoch,babe_next_epoch,aura_slot_duration
   recorded against 79 ms of real work. `_count` is exact and matched the client
   (+666 vs `ok=666`).
 
+## Mixed load
+
+**50% of each ceiling at once does not degrade a node holding 2000 light peers.**
+Six loaded runs against six baselines, 300 s each, alternating:
+
+| | node CPU | chain deficit (see `chain-deficit`) |
+|---|---|---|
+| 2000 peers only | 85% | +0.0, −0.1, +0.1, +5.9, +0.1, +6.0 |
+| 2000 peers + mix | **418%** | +5.7, −0.4, −0.3, −0.3, +5.7, −6.3 |
+
+The mix mean (+0.7 s) is *lower* than baseline (+2.0 s). Load was real — 5× the
+CPU, and every leg held target (calls ~1975/s, reads ~337/s, warp 13.0/s).
+
+The mix ran calls 2000/s + reads 345/s + warp 13/s = 755 MB/s ≈ 6.0 Gbps, so the
+serving legs were on loopback while the 2000 holders stayed remote (~250 kB/s). The
+loopback generator cost 3.25 of 16 cores against the node's 3.7 — real
+contamination, but there was headroom and the result is negative anyway.
+
+**Both light legs shed slightly under the mix** — calls ~1.1%, reads ~2.7% — at
+half their solo ceilings. Suggestive of contention between legs, but the solo runs
+used different `--clients`, so it is not yet a clean comparison.
+
+**Watch the resolution.** The deficit is quantised to one block (~6 s): `wall_ms`
+is a fixed ~312 s window and `chain_ms` is always a multiple of 6000. So a 300 s
+run cannot resolve better than ±6 s, which is what produces the bimodal ~0/~±6
+pattern above in *both* conditions. Longer windows, not more repeats, are what buy
+precision.
+
 ## Open
 
 - Reads (~1.09 GiB/s of near-pure copy — 772 B of trie nodes around a 1.7 MB blob)
   may be our client/loopback limit rather than the node's.
-- Why warp parallelism is ~2.
-- **Mixed load is unmeasured.** The ceilings were measured in isolation but share
-  the litep2p event loop and the trie/DB. 50% of each = 770 MB/s ≈ 6.2 Gbps, so
-  loopback or 10 GbE only. Warp is the leg to watch: 79 ms per request at ~2-way
-  parallelism is the most likely to interfere with block import.
+- Why warp parallelism is ~2. The aggregate is node-bound (two independent
+  generator processes at concurrency 10 each gave 25.5/s, the same as one process
+  at 20), and node CPU accounting supports the per-proof cost: (234−82)% ÷ 25.9/s =
+  **59 ms**, and (183−82)% ÷ 13/s = **78 ms** of node CPU per proof. What is *not*
+  separable is worker count from per-worker service time.
+- Whether the per-leg shedding above is real contention.
 - `enp65s0f1` is DOWN on both hosts — a 10 GbE direct link if brought up, which
-  would also stop the generator competing for the node's cores.
+  would let the mix run without the generator competing for the node's cores.
 
 Phase 1–2 peer results are unaffected: announcements at 5000 held peers are
 ~250 kB/s, 0.2% of even the routed path.
