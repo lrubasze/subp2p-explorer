@@ -87,7 +87,7 @@ subp2p-explorer-cli warp-sync $B --requests 1 --begin-block 0 --step 0 \
 wait
 ```
 
-Then `./chain-deficit results/mix-1` for the verdict.
+Then `./chain-drift results/mix-1` for the verdict.
 
 ## Traps
 
@@ -105,7 +105,7 @@ Then `./chain-deficit results/mix-1` for the verdict.
 **50% of each ceiling at once does not degrade a node holding 2000 light peers.**
 Six loaded runs against six baselines, 300 s each, alternating:
 
-| | node CPU | chain deficit (see `chain-deficit`) |
+| | node CPU | chain drift (see `chain-drift`) |
 |---|---|---|
 | 2000 peers only | 85% | +0.0, −0.1, +0.1, +5.9, +0.1, +6.0 |
 | 2000 peers + mix | **418%** | +5.7, −0.4, −0.3, −0.3, +5.7, −6.3 |
@@ -122,7 +122,7 @@ contamination, but there was headroom and the result is negative anyway.
 half their solo ceilings. Suggestive of contention between legs, but the solo runs
 used different `--clients`, so it is not yet a clean comparison.
 
-**Watch the resolution.** The deficit is quantised to one block (~6 s): `wall_ms`
+**Watch the resolution.** The drift is quantised to one block (~6 s): `wall_ms`
 is a fixed ~312 s window and `chain_ms` is always a multiple of 6000. So a 300 s
 run cannot resolve better than ±6 s, which is what produces the bimodal ~0/~±6
 pattern above in *both* conditions. Longer windows, not more repeats, are what buy
@@ -136,7 +136,7 @@ Same mix, run long: 2000 held peers (remote) plus all three legs on loopback, th
 | | 6 h run | 12 h run |
 |---|---|---|
 | load / tail | 5 h + 1 h | 11 h + 1 h |
-| **chain deficit** | **+1.5 s** (0.007%) | **−0.6 s** (−0.001%) |
+| **chain drift** | **+1.5 s** (0.007%) | **−0.6 s** (−0.001%) |
 | peers held | 2000/2000 | 2000/2000 |
 | node CPU under load | 475% | 471–480% |
 | calls served | 34,890,505 (3.1% shed) | 76,431,693 (3.5% shed) |

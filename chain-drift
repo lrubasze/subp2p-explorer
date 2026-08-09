@@ -1,9 +1,9 @@
 #!/bin/bash
 
-# How far did the node fall behind the chain during a run?
+# How far did the node drift from the chain during a run?
 #
-#   ./chain-deficit results/light-2000-r1 [more run dirs...]
-#   ./chain-deficit results/*/            # everything with a node.csv
+#   ./chain-drift results/light-2000-r1 [more run dirs...]
+#   ./chain-drift results/*/              # everything with a node.csv
 #
 # Writes `chain.txt` into each run directory and prints one line per run.
 # `make-report` reads those files, so run this before rebuilding the report.
@@ -12,10 +12,10 @@
 # long the node took (wall clock) against how long the chain took to author those
 # same blocks (on-chain timestamps):
 #
-#     deficit = wall_ms - chain_ms
+#     drift = wall_ms - chain_ms
 #
-# Positive means the node lost ground, ~0 means it kept pace, negative means it
-# caught up. No anchor, no assumed block time.
+# Positive drift means the node lost ground, ~0 means it kept pace, negative means
+# it caught up. No anchor, no assumed block time.
 #
 # WHY NOT THE OLD FORMULA. Until 4 Aug 2026 this repo used
 #
@@ -25,7 +25,7 @@
 # the node. Kusama does not hold 6.0s: windows measured the same day ran at 6.00,
 # 6.12, 6.50 and 6.80 s/block. At 6.5 s/block that formula invents ~26s of "lag"
 # over a 300s run -- larger than the whole spread it was being used to interpret.
-# Re-analysed with the deficit, the 17-run peer campaign separates cleanly
+# Re-analysed with drift, the 17-run peer campaign separates cleanly
 # (everything <=3500 peers in -12.9..+1.3s, everything >=4250 in +7.1..+138.4s)
 # where the old metric had those groups overlapping.
 #
@@ -40,7 +40,7 @@
 # Timestamps are cached in $RESULTS/.chain-ts, so re-runs need no RPC.
 #
 # FULL=1 fetches every block in each run's range, not just the endpoints. That is
-# what `make-report` needs to draw a deficit-over-time trace; ~50 blocks per run
+# what `make-report` needs to draw a drift-over-time trace; ~50 blocks per run
 # instead of 2, so do it once and let the cache carry it.
 
 set -u
@@ -125,7 +125,7 @@ fi
 
 ts() { awk -v b="$1" '$1 == b { print $2; exit }' "$CACHE"; }
 
-printf '%-22s %7s %9s %9s %11s\n' run blocks wall_s chain_s deficit_s
+printf '%-22s %7s %9s %9s %11s\n' run blocks wall_s chain_s drift_s
 for d in "${dirs[@]}"; do
     read -r b0 bN wall < <(window "$d") || continue
     t0=$(ts "$b0")
@@ -139,7 +139,7 @@ for d in "${dirs[@]}"; do
         BEGIN {
             printf "%-22s %7d %9.1f %9.1f %+11.1f\n", n, blks, w/1000, c/1000, (w-c)/1000
         }'
-    printf 'b0=%d\nbN=%d\nblocks=%d\nwall_ms=%d\nchain_ms=%d\ndeficit_s=%.1f\n' \
+    printf 'b0=%d\nbN=%d\nblocks=%d\nwall_ms=%d\nchain_ms=%d\ndrift_s=%.1f\n' \
         "$b0" "$bN" $((bN - b0)) "$wall" "$chain" \
         "$(awk -v w="$wall" -v c="$chain" 'BEGIN { print (w-c)/1000 }')" > "$d/chain.txt"
 done

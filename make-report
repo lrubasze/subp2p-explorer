@@ -9,14 +9,14 @@
 # and no network. Re-run it after adding runs; it simply rebuilds from whatever
 # `results/light-*` directories exist. Runs still in flight are skipped.
 #
-# Chain deficit is the metric the report is built around: how much longer the node
+# Chain drift is the metric the report is built around: how much longer the node
 # took to import a range of blocks than the chain took to author them. Run
-# `./chain-deficit` first -- it writes the `chain.txt` this reads, and `FULL=1`
+# `./chain-drift` first -- it writes the `chain.txt` this reads, and `FULL=1`
 # additionally caches every block in range so the over-time traces can be drawn.
 #
 # It replaces the anchor formula this script used until 4 Aug 2026, which assumed
 # a fixed 6.0s block time and charged any deviation to the node. See the header of
-# `chain-deficit` for why that was wrong and by how much.
+# `chain-drift` for why that was wrong and by how much.
 
 set -u
 
@@ -27,7 +27,7 @@ CACHE=${CACHE:-$RESULTS/.chain-ts}
 
 [ -f "$TEMPLATE" ] || { echo "missing template: $TEMPLATE" >&2; exit 1; }
 [ -d "$RESULTS" ] || { echo "no results directory: $RESULTS" >&2; exit 1; }
-[ -s "$CACHE" ] || { echo "no timestamp cache: run ./chain-deficit first" >&2; exit 1; }
+[ -s "$CACHE" ] || { echo "no timestamp cache: run ./chain-drift first" >&2; exit 1; }
 
 # Per-run summary: one object per completed run.
 runs=$(
@@ -36,29 +36,29 @@ runs=$(
         # No summary line means the run never finished; skip rather than emit blanks.
         grep -q "^spread ms:" "$d/hold.log" 2>/dev/null || continue
 
-        # No chain.txt means chain-deficit has not been run for this directory.
+        # No chain.txt means chain-drift has not been run for this directory.
         [ -f "$d/chain.txt" ] || continue
 
         peers=$(grep -oP 'peers=\K[0-9]+' "$d/meta.txt")
         held=$(grep -oP '^held:       peak \K[0-9]+' "$d/hold.log")
         cov=$(grep -oP '^coverage:   mean \K[0-9.]+' "$d/hold.log")
         read -r p50 mx < <(grep -oP '^spread ms:  p50=\K[0-9.]+|max=\K[0-9.]+' "$d/hold.log" | tr '\n' ' ')
-        deficit=$(grep -oP '^deficit_s=\K.*' "$d/chain.txt")
+        drift=$(grep -oP '^drift_s=\K.*' "$d/chain.txt")
 
         awk -F, -v name="$(basename "$d")" -v peers="$peers" \
-            -v held="$held" -v cov="$cov" -v p50="$p50" -v mx="$mx" -v deficit="$deficit" '
+            -v held="$held" -v cov="$cov" -v p50="$p50" -v mx="$mx" -v drift="$drift" '
             NR>2 { cpu+=$2; n++; if ($3>rss) rss=$3 }
-            END { if (n>0) printf "{\"run\":\"%s\",\"peers\":%s,\"deficit\":%.1f,\"spread50\":%s,\"spreadMax\":%s,\"coverage\":%s,\"held\":%s,\"cpu\":%.1f,\"rss\":%.0f}\n",
-                    name, peers, deficit, p50, mx, cov, held, cpu/n, rss/1024 }' "$d/node.csv"
+            END { if (n>0) printf "{\"run\":\"%s\",\"peers\":%s,\"drift\":%.1f,\"spread50\":%s,\"spreadMax\":%s,\"coverage\":%s,\"held\":%s,\"cpu\":%.1f,\"rss\":%.0f}\n",
+                    name, peers, drift, p50, mx, cov, held, cpu/n, rss/1024 }' "$d/node.csv"
     done | paste -sd, -
 )
 
 [ -n "$runs" ] || { echo "no completed runs found in $RESULTS" >&2; exit 1; }
 
-# Deficit-over-time traces for the runs the report charts by name. Each point is
+# Drift-over-time traces for the runs the report charts by name. Each point is
 # elapsed wall time minus the chain time spanned by the blocks imported so far, so
 # it starts at 0 and rises only when the node genuinely loses ground. Needs a
-# timestamp for every block in range: FULL=1 ./chain-deficit.
+# timestamp for every block in range: FULL=1 ./chain-drift.
 series=$(
     for d in light-2000-r1 light-3500-r1 light-5000-r2 light-5000-r1; do
         [ -f "$RESULTS/$d/node.csv" ] || continue
@@ -70,7 +70,7 @@ series=$(
                 printf "%s[%.0f,%.1f]", (n++ ? "," : ""), ($1-t0)/1000, (($1-t0)-(ts[$7]-c0))/1000
             }
             END { if (missing) exit 1 }' "$CACHE" "$RESULTS/$d/node.csv") || {
-            echo "  skipping $d trace: cache incomplete, run FULL=1 ./chain-deficit" >&2
+            echo "  skipping $d trace: cache incomplete, run FULL=1 ./chain-drift" >&2
             continue
         }
         printf '"%s":[%s]\n' "$d" "$trace"
