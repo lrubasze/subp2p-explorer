@@ -13,3 +13,8 @@ cache/
 
 # per-run measurement data
 results/
+
+# report tooling — rendered output and deps
+report/out/
+report/node_modules/
+peer-capacity-report.html

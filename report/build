@@ -1,0 +1,190 @@
+#!/bin/bash
+# Build the publishable peer-capacity report.
+#
+#   ./report/build                # writes peer-capacity-report.html (fragment)
+#
+# Stages:
+#   1. extract the 17 peer-campaign runs        -> results/.report-build/peerruns.json
+#   2. extract drift-over-time traces (long runs) -> results/.report-build/traces.json
+#      (fetches any missing block timestamps into results/.chain-ts via dev-machine2)
+#   3. assemble everything                       -> results/.report-build/viz-data.json
+#   4. inject into report/template.html          -> peer-capacity-report.html
+#
+# The output is a *fragment* (no <html>/<head>/<body>) so it can be published as a
+# claude.ai artifact unchanged. `report/publish-pages` wraps it into a full document
+# for GitHub Pages. Requires `./chain-drift` to have been run on every run directory
+# first (stage 1 refuses runs without chain.txt).
+#
+# Chain drift, the metric everything here is built around: wall-clock elapsed minus
+# the on-chain time spanned by the blocks the node imported. Positive = lost ground.
+set -eu
+cd "$(dirname "$0")/.."
+BUILD=results/.report-build
+CACHE=results/.chain-ts
+mkdir -p "$BUILD"
+
+# ---------- 1. peer-campaign runs ----------
+RUNS=(light-100 light-200 light-500 light-1000-r1 light-1000-r2 \
+      light-2000-r1 light-2000-r2 light-2000-r3 light-2000-r4 \
+      light-3500-r1 light-3500-r2 light-4250-r1 light-4250-r2 \
+      light-5000-r1 light-5000-r2 light-5000-r3 light-5000-r4)
+{
+echo "["
+first=1
+for r in "${RUNS[@]}"; do
+  d=results/$r
+  [ -f "$d/chain.txt" ] || { echo "missing $d/chain.txt — run ./chain-drift $d" >&2; exit 1; }
+  peers=$(grep -oP 'peers=\K[0-9]+' "$d/meta.txt")
+  held=$(grep -oP '^held:       peak \K[0-9]+' "$d/hold.log" | tail -1)
+  cov=$(grep -oP '^coverage:   mean \K[0-9.]+' "$d/hold.log")
+  p50=$(grep -oP '^spread ms:  p50=\K[0-9.]+' "$d/hold.log")
+  p90=$(grep -oP '^spread ms:.* p90=\K[0-9.]+' "$d/hold.log")
+  p99=$(grep -oP '^spread ms:.* p99=\K[0-9.]+' "$d/hold.log")
+  pmax=$(grep -oP '^spread ms:.* max=\K[0-9.]+' "$d/hold.log")
+  ref=$(grep -oP "refused=\K[0-9]+" "$d/hold.log" | tail -1)
+  evi=$(grep -oP "evicted=\K[0-9]+" "$d/hold.log" | tail -1)
+  drift=$(grep -oP '^drift_s=\K.*' "$d/chain.txt")
+  blk=$(grep -oP '^blocks=\K.*' "$d/chain.txt")
+  win=$(awk -F, 'NR>2{if(k==0)t0=$1;tN=$1;k++} END{printf "%.0f",(tN-t0)/1000}' "$d/node.csv")
+  # ramp ΔRSS: growth from the run's first sample to ~120 s, when all peers are connected —
+  # isolates connection memory from the node's uptime RSS growth (runs are not separated by restarts)
+  ramp=$(awk -F, 'NR>2 && $3!="" {if(!t0){t0=$1;r0=$3} if(($1-t0)/1000<=125)rN=$3}
+    END{printf "%.0f",(rN-r0)/1024}' "$d/node.csv")
+  # rss: peak MB · cpu: mean % · fds/conns: peak · finlag: mean and max of best-finalized (blocks)
+  read -r rss cpu fds finmean finmax < <(awk -F, 'NR>2{
+      if($3>m)m=$3; if($2!=""){c+=$2;k++}; if($4>fd)fd=$4;
+      if($7!=""&&$8!=""){lag=$7-$8; if(lag>lx)lx=lag; ls+=lag; ln++}}
+    END{printf "%.0f %.0f %d %.1f %d\n", m/1024, (k?c/k:0), fd, (ln?ls/ln:0), lx}' "$d/node.csv")
+  [ $first -eq 1 ] && first=0 || echo ","
+  printf '{"run":"%s","peers":%s,"drift":%s,"blocks":%s,"window":%s,"held":%s,"coverage":%s,"spread50":%s,"spread90":%s,"spread99":%s,"spreadMax":%s,"refused":%s,"evicted":%s,"rss":%s,"rampRss":%s,"cpu":%s,"fds":%s,"finlag_mean":%s,"finlag_max":%s}' \
+    "$r" "$peers" "$drift" "$blk" "$win" "$held" "$cov" "$p50" "$p90" "$p99" "$pmax" "$ref" "$evi" "$rss" "$ramp" "$cpu" "$fds" "$finmean" "$finmax"
+done
+echo
+echo "]"
+} > "$BUILD/peerruns.json"
+echo "peer runs: $(python3 -c "import json;print(len(json.load(open('$BUILD/peerruns.json'))))")"
+
+# ---------- 2. drift traces for the long runs ----------
+LONGS="peers-6h soak-6h soak-12h"
+: > "$BUILD/tr-samples.txt"
+for r in $LONGS; do
+  [ -f "results/$r/node.csv" ] || continue
+  awk -F, -v r="$r" 'NR>2 && $7!="" {if(t0==0){t0=$1; print r, 0, $7; last=0}
+    el=($1-t0)/1000; if(el-last>=600){print r, int(el), $7; last=el}}' "results/$r/node.csv" >> "$BUILD/tr-samples.txt"
+done
+awk '{print $3}' "$BUILD/tr-samples.txt" | sort -un > "$BUILD/tr-blocks.txt"
+touch "$CACHE"
+need=$(while read -r b; do grep -q "^$b " "$CACHE" || echo "$b"; done < "$BUILD/tr-blocks.txt")
+echo "trace samples: $(wc -l < "$BUILD/tr-samples.txt") | timestamps to fetch: $(echo "$need" | grep -c . || true)"
+
+# Missing timestamps are decoded from the Timestamp inherent in the block body —
+# state is pruned (~256 blocks) so state_getStorage would fail for anything older.
+if [ -n "$need" ]; then
+  {
+    echo "for b in $(echo "$need" | tr '\n' ' '); do"
+    echo '  h=$(curl -s -H "Content-Type: application/json" -d "{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"chain_getBlockHash\",\"params\":[$b]}" http://127.0.0.1:9944 | grep -o "0x[0-9a-f]*")'
+    echo '  x=$(curl -s -H "Content-Type: application/json" -d "{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"chain_getBlock\",\"params\":[\"$h\"]}" http://127.0.0.1:9944 | grep -o "\"extrinsics\":\[\"0x[0-9a-f]*" | grep -o "0x[0-9a-f]*")'
+    echo '  [ -n "$x" ] && echo "$b $x"'
+    echo "done"
+  } | ssh dev-machine2 bash -s | python3 -c '
+import sys
+def moment(h):
+    d=bytes.fromhex(h[2:])
+    for i in range(len(d)):
+        if d[i]&3==3 and (d[i]>>2)+4==len(d)-i-1: return int.from_bytes(d[i+1:],"little")
+for line in sys.stdin:
+    p=line.split()
+    if len(p)==2 and p[1].startswith("0x"):
+        m=moment(p[1])
+        if m: print(p[0],m)' >> "$CACHE"
+fi
+
+# ---------- 3 + 4. assemble and inject ----------
+BUILD="$BUILD" python3 - <<'PY'
+import json, csv, os, collections
+
+BUILD = os.environ['BUILD']
+
+ts = {}
+for line in open('results/.chain-ts'):
+    p = line.split()
+    if len(p) == 2: ts[int(p[0])] = int(p[1])
+
+def nodecsv(run):
+    p = f'results/{run}/node.csv'
+    if not os.path.exists(p): return []
+    rows = []
+    with open(p) as f:
+        r = csv.reader(f); next(r, None)
+        for row in r:
+            if len(row) >= 8 and row[0].isdigit(): rows.append(row)
+    return rows
+
+def trace(run, col, scale, every=600):
+    rows = nodecsv(run)
+    if not rows: return []
+    t0 = int(rows[0][0]); out = []; last = -1e9
+    for row in rows:
+        if not row[col]: continue
+        el = (int(row[0]) - t0) / 1000
+        if el - last >= every:
+            out.append([int(el), round(float(row[col]) * scale)]); last = el
+    return out
+
+def cpu_mean(run):
+    v = [float(r[1]) for r in nodecsv(run) if r[1]]
+    return round(sum(v) / len(v)) if v else None
+
+def drift(run):
+    p = f'results/{run}/chain.txt'
+    if not os.path.exists(p): return None
+    d = dict(l.strip().split('=', 1) for l in open(p) if '=' in l)
+    return float(d['drift_s'])
+
+data = {}
+data['peerRuns'] = json.load(open(f'{BUILD}/peerruns.json'))
+
+# drift-over-time traces from the sampled (elapsed, best) pairs + timestamp cache
+runs = collections.OrderedDict()
+for line in open(f'{BUILD}/tr-samples.txt'):
+    r, el, b = line.split()
+    runs.setdefault(r, []).append((int(el), int(b)))
+traces = {}
+for r, pts in runs.items():
+    b0 = pts[0][1]
+    if b0 not in ts: continue
+    traces[r] = [[el, round((el * 1000 - (ts[b] - ts[b0])) / 1000, 1)] for el, b in pts if b in ts]
+data['traces'] = traces
+
+data['rss'] = {r: trace(r, 2, 1 / 1024) for r in ['peers-6h', 'soak-6h', 'soak-12h']}
+data['cpu'] = {r: trace(r, 1, 1) for r in ['peers-6h', 'soak-6h', 'soak-12h']}
+
+mix = []
+for i in range(1, 7):
+    for kind in ('base', 'mix'):
+        run = f'rep-{kind}-{i}'
+        if drift(run) is not None:
+            mix.append({'run': run, 'kind': kind, 'i': i, 'drift': drift(run), 'cpu': cpu_mean(run)})
+data['mixRuns'] = mix
+
+longs = []
+for run, label, load in [('peers-6h', '6 h', 'peers only'),
+                         ('soak-6h', '6 h', 'peers + serving mix'),
+                         ('soak-12h', '12 h', 'peers + serving mix')]:
+    rows = nodecsv(run)
+    if not rows: continue
+    longs.append({'run': run, 'label': label, 'load': load, 'drift': drift(run),
+                  'hours': round((int(rows[-1][0]) - int(rows[0][0])) / 3600000, 2),
+                  'cpu': cpu_mean(run),
+                  'rss0': round(int(rows[0][2]) / 1024),
+                  'rssMax': max(round(int(r[2]) / 1024) for r in rows)})
+data['longRuns'] = longs
+
+json.dump(data, open(f'{BUILD}/viz-data.json', 'w'))
+print('assembled:', {k: (len(v) if hasattr(v, '__len__') else v) for k, v in data.items()})
+
+tpl = open('report/template.html').read()
+assert '__DATA__' in tpl, 'template lost its __DATA__ slot'
+open('peer-capacity-report.html', 'w').write(tpl.replace('__DATA__', json.dumps(data)))
+print('wrote peer-capacity-report.html')
+PY

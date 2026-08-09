@@ -1,0 +1,47 @@
+#!/bin/bash
+# Publish the report (and the issue's chart PNGs) to the gh-pages branch of the
+# lrubasze fork, where GitHub Pages serves it.
+#
+#   ./report/build && (cd report && bun run render.js)   # build + render first
+#   ./report/publish-pages
+#
+# Layout on gh-pages:
+#   index.html                 the wrapped report (from report/out/index.html)
+#   img/sec-*.png              section PNGs embedded in the sdk issue, referenced as
+#                              https://raw.githubusercontent.com/lrubasze/subp2p-explorer/gh-pages/img/<name>.png
+#
+# Uses a temporary worktree so the main checkout is untouched.
+set -eu
+cd "$(dirname "$0")/.."
+REMOTE=lrubasze
+# push over https — the box has no ssh key for github, but gh's credential helper is set up
+PUSH_URL=https://github.com/lrubasze/subp2p-explorer.git
+BRANCH=gh-pages
+
+[ -f report/out/index.html ] || { echo "no report/out/index.html — run report/render.js first" >&2; exit 1; }
+
+WT=$(mktemp -d)
+trap 'git worktree remove --force "$WT" 2>/dev/null || true; rm -rf "$WT"' EXIT
+
+if git ls-remote --exit-code "$PUSH_URL" "refs/heads/$BRANCH" >/dev/null 2>&1; then
+  git fetch "$PUSH_URL" "refs/heads/$BRANCH:refs/remotes/$REMOTE/$BRANCH"
+  git worktree add "$WT" "$REMOTE/$BRANCH" --detach
+else
+  git worktree add "$WT" --detach
+  git -C "$WT" checkout --orphan "$BRANCH"
+  git -C "$WT" rm -rf --quiet . 2>/dev/null || true
+fi
+
+cp report/out/index.html "$WT/index.html"
+mkdir -p "$WT/img"
+cp report/out/sec-*.png report/out/fig-*.png "$WT/img/" 2>/dev/null || true
+touch "$WT/.nojekyll"
+
+git -C "$WT" add -f index.html img .nojekyll
+if git -C "$WT" diff --cached --quiet; then
+  echo "nothing changed — not publishing"
+  exit 0
+fi
+git -C "$WT" commit --no-gpg-sign -m "report: $(date -u +%Y-%m-%dT%H:%MZ)"
+git -C "$WT" push "$PUSH_URL" "HEAD:refs/heads/$BRANCH"
+echo "published: https://lrubasze.github.io/subp2p-explorer/"

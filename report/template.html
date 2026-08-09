@@ -1,0 +1,661 @@
+<title>Light-peer capacity of a Kusama full node</title>
+
+<style>
+  :root {
+    color-scheme: light;
+    --ground:      #f5f5f5;
+    --surface:     #ffffff;
+    --surface-2:   #fafafa;
+    --ink:         #333333;
+    --ink-2:       #555555;
+    --ink-3:       #666666;
+    --rule:        #dddddd;
+    --rule-firm:   #C8D4E3;
+    --accent:      #007bff;
+    --accent-dark: #0056b3;
+    --s1:          #0000ff;
+    --s2:          #ff0000;
+    --s3:          #008000;
+    --band:        rgba(255,0,0,.10);
+    --floor:       rgba(42,63,95,.09);
+    --plot:        #E5ECF6;
+    --grid:        #ffffff;
+    --axis:        #2a3f5f;
+  }
+
+  body {
+    margin: 0; background: var(--ground); color: var(--ink);
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 15px; line-height: 1.6;
+  }
+  .wrap { max-width: 1320px; margin: 20px auto; padding: 24px 32px 48px; background: var(--surface);
+    display: flex; flex-direction: column; gap: 30px; }
+  .prose { max-width: 80ch; }
+
+  h1 { font-size: 28px; line-height: 1.2; font-weight: 700; margin: 0; color: var(--ink);
+    border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  h2 { font-size: 20px; font-weight: 700; margin: 0; color: var(--ink-2);
+    border-bottom: 2px solid var(--rule); padding-bottom: 5px; }
+  h3 { font-size: 16px; font-weight: 400; margin: 0; color: var(--axis); }
+  p  { margin: 0; color: var(--ink-2); }
+  p strong, li strong { color: var(--ink); font-weight: 700; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  .eyebrow {
+    font-size: 11px; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--ink-3); font-weight: 700;
+  }
+  .lede { font-size: 16px; line-height: 1.55; color: var(--ink-2); }
+
+  section { display: flex; flex-direction: column; gap: 14px; }
+  .head { display: flex; flex-direction: column; gap: 5px; }
+
+  /* ---- verdict ---- */
+  .verdict {
+    background: #e7f3ff; border-left: 4px solid var(--accent);
+    padding: 15px 20px; display: flex; flex-direction: column; gap: 10px;
+  }
+  .verdict .top { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+  .hero-num {
+    font-size: 42px; line-height: 1; font-weight: 700; letter-spacing: -.02em;
+    font-variant-numeric: tabular-nums; color: var(--accent);
+  }
+
+  /* ---- kpi ---- */
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(178px, 1fr)); gap: 12px; }
+  .kpi {
+    background: var(--surface); border: 1px solid var(--rule);
+    padding: 12px 14px; display: flex; flex-direction: column; gap: 5px;
+  }
+  .kpi .k { font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-3); font-weight: 700; }
+  .kpi .v { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; color: var(--accent); }
+  .kpi .n { font-size: 12.5px; color: var(--ink-3); line-height: 1.4; }
+
+  /* ---- chart cards ---- */
+  .card {
+    background: var(--surface-2); border: 1px solid var(--rule);
+    padding: 15px 18px 12px; display: flex; flex-direction: column; gap: 12px;
+  }
+  .card-head { display: flex; flex-direction: column; gap: 4px; }
+  .card-note { font-size: 12.5px; color: var(--ink-3); line-height: 1.5; }
+  .chart-host { position: relative; }
+  svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .grid-line { stroke: var(--grid); stroke-width: 1; }
+  .axis-line { stroke: var(--rule-firm); stroke-width: 1; }
+  .zero-line { stroke: var(--axis); stroke-width: 1; stroke-dasharray: 4 3; opacity: .55; }
+  .tick { font-size: 11px; fill: var(--axis); font-variant-numeric: tabular-nums; }
+  .axis-title { font-size: 12px; fill: var(--axis); }
+  .mark-label { font-size: 11px; fill: var(--axis); font-variant-numeric: tabular-nums; font-weight: 700;
+    paint-order: stroke; stroke: var(--plot); stroke-width: 3px; }
+  .band-label { font-size: 10px; fill: var(--axis); letter-spacing: .09em; text-transform: uppercase; opacity: .85;
+    paint-order: stroke; stroke: var(--plot); stroke-width: 3px; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; }
+  .lg { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--ink-2); }
+  .sw { width: 11px; height: 11px; border-radius: 50%; flex: none; }
+  .sw.sq { border-radius: 0; width: 16px; height: 3px; }
+  .sw.dash { background: none !important; border-top: 3px dashed var(--sw-c, #999); height: 0; }
+
+  .tip {
+    position: absolute; pointer-events: none; opacity: 0; transition: opacity .1s;
+    background: #2a3f5f; color: #fff; padding: 7px 10px; border-radius: 4px;
+    font-size: 12px; line-height: 1.45; white-space: nowrap; z-index: 5;
+    font-variant-numeric: tabular-nums; box-shadow: 0 4px 14px rgba(0,0,0,.22);
+  }
+  .tip.on { opacity: 1; }
+  .tip b { font-weight: 700; }
+
+  .two { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+
+  /* ---- collapsibles & tables ---- */
+  details { background: var(--surface); }
+  summary { padding: 10px 15px; cursor: pointer; font-weight: 700; font-size: 14px; list-style: none;
+    display: flex; align-items: center; gap: 9px; background: var(--accent); color: #fff; border-radius: 4px;
+    user-select: none; }
+  summary:hover { background: var(--accent-dark); }
+  summary::-webkit-details-marker { display: none; }
+  summary::before { content: "\25B6"; font-size: 11px; transition: transform .15s; display: inline-block; }
+  details[open] summary::before { transform: rotate(90deg); }
+  details[open] summary { border-radius: 4px 4px 0 0; }
+  summary:focus-visible { outline: 2px solid var(--accent-dark); outline-offset: -2px; }
+  details > *:not(summary) { border: 1px solid var(--rule); border-top: none; }
+  details > .table-scroll + .card-note { margin-top: 0; }
+  .table-scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; font-variant-numeric: tabular-nums; }
+  th, td { padding: 8px 12px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--rule); }
+  th { font-size: 12px; color: #fff; background: var(--accent); font-weight: 700;
+    position: sticky; top: 0; }
+  th:first-child, td:first-child { text-align: left; }
+  tbody tr:nth-child(even) { background: #f9f9f9; }
+  tbody tr:last-child td { border-bottom: none; }
+  td.flag { color: #c82333; font-weight: 700; }
+
+  ul.tight { margin: 0; padding-left: 20px; color: var(--ink-2); display: flex; flex-direction: column; gap: 7px; }
+  ul.tight li::marker { color: var(--ink-3); }
+
+  code { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: .9em; background: #f0f0f0; border: 1px solid var(--rule);
+    padding: 1px 5px; border-radius: 3px; }
+
+  footer { border-top: 1px solid var(--rule); padding-top: 18px; font-size: 13px; color: var(--ink-3); }
+
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+</style>
+
+<div class="wrap">
+
+  <header class="head prose">
+    <div class="eyebrow">polkadot-sdk · network · light peers</div>
+    <h1>How many light peers can a full node actually hold?</h1>
+    <p class="lede">The default for <code>--in-peers-light</code> is 100. We measured a real
+    Kusama full node on hardware close to the reference spec: it holds 3500 light peers with
+    no effect on block import, and starts falling behind somewhere between 3500 and 4250.</p>
+  </header>
+
+  <div class="verdict">
+    <div class="top">
+      <span class="hero-num" id="v-rec">2000</span>
+      <div>
+        <div style="font-weight:620">is the recommended new default</div>
+        <div style="font-size:13.5px;color:var(--ink-3)">~2× margin below the measured threshold · 20× the current value</div>
+      </div>
+    </div>
+  </div>
+
+  <section>
+    <div class="kpis" id="kpis"></div>
+  </section>
+
+  <!-- ============ THE THRESHOLD ============ -->
+  <section id="sec-threshold">
+    <div class="head">
+      <div class="eyebrow">Primary result · 17 runs · 300 s each</div>
+      <h2>The threshold sits between 3500 and 4250 peers</h2>
+      <p class="prose"><strong>The test:</strong> connect N light peers to the node and keep them
+      connected for 300 seconds while the node follows Kusama. The peers do nothing — they only
+      hold their slots. We read the node's own metrics every 5 seconds. One run per data point,
+      N from 100 to 5000, with repeats at the interesting counts. The node's limit
+      (<code>--in-peers-light</code>) was set to 5000 in every run, so what varies is N — the
+      number of peers the node actually holds. We watch three things: does the node keep up
+      with the chain (chain drift), and what does holding cost (CPU, memory).</p>
+    </div>
+    <div class="card">
+      <div class="chart-host">
+        <svg id="c-threshold" viewBox="0 0 940 400" role="img"
+             aria-label="Chain drift against peer count. At or below zero up to 3500 peers, rising at 4250, reaching 138 seconds at 5000."></svg>
+        <div class="tip" id="t-threshold"></div>
+      </div>
+      <div class="legend" id="l-threshold"></div>
+      <div class="card-note"><strong>Chain drift</strong>: how many seconds the node fell behind
+      the chain during the run. Two clocks are compared — how much real time passed, and how
+      much chain time the imported blocks cover (from their on-chain timestamps). 0 = kept up;
+      +12 s = ended the run 12 s further behind than it started; negative = caught up. Each
+      point is one run. The metric only resolves whole blocks (~6 s), and the gap between the
+      two groups is 2.2 blocks — clearly wider than that. The 5000-peer stall (+138.4 s) is
+      drawn at the top edge so the other sixteen runs stay readable.</div>
+    </div>
+    <div class="two">
+      <div class="card">
+        <div class="card-head"><h3>Node CPU</h3><div class="card-note">percent of one core, mean over the run</div></div>
+        <div class="chart-host">
+          <svg id="c-cpu" viewBox="0 0 460 260" role="img" aria-label="Node CPU rises smoothly from 46 percent at 100 peers to 111 percent at 5000."></svg>
+          <div class="tip" id="t-cpu"></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>Connection memory</h3><div class="card-note">How much the node's memory jumps
+        while the peers connect (run start → t=120 s, MB). This isolates the cost of the
+        connections themselves — the node's memory also grows slowly on its own, and runs were
+        not separated by restarts. Below ~1000 peers the jump is smaller than normal 2-minute
+        noise, so the left-most points mean little.</div></div>
+        <div class="chart-host">
+          <svg id="c-rss" viewBox="0 0 460 260" role="img" aria-label="Connection memory grows near-linearly with peer count, about 60 KB per peer, reaching 350 MB at 5000 peers."></svg>
+          <div class="tip" id="t-rss"></div>
+        </div>
+      </div>
+    </div>
+    <div class="prose">
+      <h3 style="margin-bottom:8px">Reading the three charts</h3>
+      <ul class="tight">
+        <li><strong>Chain drift</strong>: flat up to 3500 peers (−13.0…+1.4 s). Every run at
+        4250 or more falls behind (+7.1…+138.4 s). No overlap — the limit is somewhere between
+        3500 and 4250 held peers.</li>
+        <li><strong>CPU</strong>: 46% of one core at 100 peers, ~105% at 5000. Cheap — CPU is
+        not what fails first.</li>
+        <li><strong>Memory</strong>: ~45–70 KB per held peer, measured as the jump while the
+        peers connect — about +115 MB for going from 100 to 2000. (Comparing whole runs instead
+        gives a ~4–5× higher number, because the node's memory also grows slowly with uptime —
+        see the memory chart in the next section.)</li>
+        <li><strong>The limit itself never does anything:</strong> 0 peers refused, 0 evicted,
+        every announcement delivered, at every count. The node accepts every peer offered; what
+        breaks first is keeping up with the chain.</li>
+        <li><strong>Candidate: 2000</strong> — flat in all four runs, about half the threshold.
+        The long-term test below runs at this count.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ============ LONG RUN ============ -->
+  <section id="sec-long">
+    <div class="head">
+      <div class="eyebrow">Long-term test · the candidate default</div>
+      <h2>2000 peers, held for hours</h2>
+      <p class="prose">Three long runs put the candidate through time, alone and while the node
+      is also busy serving light clients:</p>
+      <ul class="tight prose">
+        <li><strong>6 h · peers only</strong> — 2000 held peers, no request load</li>
+        <li><strong>6 h · peers + serving mix</strong> — the same 2000 peers while the node also
+        serves requests</li>
+        <li><strong>12 h · peers + serving mix</strong> — the same, for twice as long</li>
+      </ul>
+      <p class="prose">The <strong>serving mix</strong>, each part at about half of what the node
+      can serve at most:</p>
+      <ul class="tight prose">
+        <li>runtime-call proofs at 2000/s (<code>/light/2</code>)</li>
+        <li>runtime-code (<code>:code</code>) read proofs at 345/s (<code>/light/2</code>)</li>
+        <li>warp-sync proofs at 13/s (<code>/sync/warp</code>)</li>
+      </ul>
+      <p class="prose">In the chart below, every sample stays within two blocks of zero, and 96%
+      within one. The zig-zag is the one-block resolution of the metric — not the node speeding
+      up and slowing down.</p>
+    </div>
+    <div class="card">
+      <div class="chart-host">
+        <svg id="c-long" viewBox="0 0 940 320" role="img"
+             aria-label="Chain drift over time for the long runs, staying flat near zero throughout."></svg>
+        <div class="tip" id="t-long"></div>
+      </div>
+      <div class="legend" id="l-long"></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h3>Memory over the long runs</h3>
+        <div class="card-note">growth in resident memory since run start (ΔRSS, MB)</div></div>
+      <div class="chart-host">
+        <svg id="c-rsstrace" viewBox="0 0 940 300" role="img"
+             aria-label="Memory growth over the long runs. The serving-mix runs climb steadily; the peers-only run stays flat."></svg>
+        <div class="tip" id="t-rsstrace"></div>
+      </div>
+      <div class="legend" id="l-rsstrace"></div>
+      <div class="card-note" id="n-rsstrace">Shown as growth since each run's start, because the
+      absolute levels can't be compared: the node was never restarted between runs, and the
+      serving runs leave memory behind even after the load stops. Note the peers-only run grows
+      too (~200 MB/h, with a steady connection count) — so serving is not the only cause. The
+      real cause is unknown; finding it needs a heap profile. Block import kept up in every run
+      regardless.</div>
+    </div>
+    <div class="kpis" id="longkpis"></div>
+  </section>
+
+  <!-- ============ MIX ============ -->
+  <section id="sec-mix">
+    <div class="head">
+      <div class="eyebrow">Secondary check · serving load</div>
+      <h2>Serving load does not move the limit</h2>
+      <p class="prose">Six runs with the serving mix on, alternating with six without it, all at
+      2000 peers. The mix (calls 2000/s, reads 345/s, warp 13/s — as above) pushes the node to
+      <strong>5× the CPU</strong> — and the loaded runs' average drift comes out <em>lower</em>
+      than the baseline's.</p>
+    </div>
+    <div class="card">
+      <div class="chart-host">
+        <svg id="c-mix" viewBox="0 0 940 260" role="img"
+             aria-label="Chain drift for six baseline and six loaded runs, both clustering on zero and plus or minus six seconds."></svg>
+        <div class="tip" id="t-mix"></div>
+      </div>
+      <div class="legend" id="l-mix"></div>
+      <div class="card-note">Every value lands on 0 or ±6 s because the metric resolves whole
+      blocks — that pattern is the resolution, not a signal.</div>
+    </div>
+  </section>
+
+  <!-- ============ DETAIL ============ -->
+  <section>
+    <div class="head">
+      <div class="eyebrow">For the record</div>
+      <h2>Every run</h2>
+      <p class="prose">What the columns mean:</p>
+      <ul class="tight prose">
+        <li><strong>peers / held</strong> — peers offered to the node, and how many it actually held (peak)</li>
+        <li><strong>drift</strong> — seconds the node fell behind the chain during the run (red = fell behind)</li>
+        <li><strong>blocks / window</strong> — blocks imported during the run, and the run length</li>
+        <li><strong>coverage</strong> — share of block announcements that reached every peer</li>
+        <li><strong>spread p50/p99/max</strong> — for one block, the time between the first and the
+        last peer getting its announcement; p50 is the middle block, p99/max the slowest</li>
+        <li><strong>refused / evicted</strong> — peers the node turned away, or dropped after connecting</li>
+        <li><strong>finality lag</strong> — how many blocks finalization ran behind best</li>
+        <li><strong>fds peak</strong> — open file descriptors of the node process, mostly one TCP
+        socket per peer (limit 131,072)</li>
+        <li><strong>ramp ΔRSS</strong> — memory jump while the peers connect: the per-peer cost</li>
+        <li><strong>RSS peak / CPU</strong> — highest memory and average CPU during the run</li>
+      </ul>
+    </div>
+    <details open>
+      <summary>Peer-count campaign — 17 runs</summary>
+      <div class="table-scroll"><table id="tbl-peers"></table></div>
+      <div class="card-note" style="padding:12px 20px 16px">Two caveats. The 1377.5 / 1836.7 ms
+      spread in <code>light-2000-r2</code> is one slow block — it still reached all 2000 peers.
+      And above 3500 peers the spread numbers are suspect: our measuring client runs thousands
+      of peers in one process and is probably the bottleneck there, not the node.</div>
+    </details>
+    <details>
+      <summary>Long runs and serving-load campaign</summary>
+      <div class="table-scroll"><table id="tbl-long"></table></div>
+      <div class="card-note" style="padding:12px 20px 16px">The RSS start column differs per run
+      because the node was never restarted: each long run starts at whatever level the previous
+      one left behind. Compare the growth, not the absolute numbers — see the memory chart
+      above.</div>
+    </details>
+    <details>
+      <summary>Method, and what the numbers do not cover</summary>
+      <div style="padding:18px 20px 22px;display:flex;flex-direction:column;gap:16px">
+        <div class="prose">
+          <h3 style="margin-bottom:6px">How degradation is measured</h3>
+          <p>Two clocks are compared: real time passed during the run, and chain time covered by
+          the blocks the node imported (read from each block's own timestamp):
+          <code>drift = wall_elapsed − chain_time_spanned</code>. Nothing is assumed about how
+          fast the chain makes blocks.</p>
+          <p style="margin-top:9px">An earlier version assumed Kusama makes a block exactly every
+          6.0 s. It does not (measured 6.00–6.80 s), and the wrong assumption produced more fake
+          "lag" than the real signal — it scored a 500-peer run worse than a 5000-peer run.
+          Always compare against real block timestamps.</p>
+        </div>
+        <div class="prose">
+          <h3 style="margin-bottom:6px">Limitations</h3>
+          <ul class="tight">
+            <li><strong>One machine, one chain, one backend.</strong> Kusama, litep2p. The libp2p backend is untested.</li>
+            <li><strong>Our machine has 4× the reference RAM</strong> (125 vs 32 GB), and most of it caches the 1.2 TB database. Importing blocks reads that data, so a 32 GB machine could fall behind at a lower peer count. This is the weakest part of the result.</li>
+            <li><strong>The network link is 2× the reference.</strong> Doesn't matter for holding peers (~250 kB/s at 5000 peers); matters for serving throughput.</li>
+            <li><strong>Our peers are silent and never disconnect.</strong> Serving load was tested separately; peers coming and going was not.</li>
+            <li>Single runs at 100, 200 and 500; the counts near the threshold have 2–4 each.</li>
+          </ul>
+        </div>
+      </div>
+    </details>
+  </section>
+
+  <footer class="prose">
+    Measured against <code>polkadot 1.24.0-0e181250542</code>, litep2p backend, Kusama, on an
+    AMD EPYC 7232P (8 physical cores, 3.1 GHz) with 125 GB RAM and a 1 Gbit/s link — the
+    reference spec asks for 8 cores @ 3.4 GHz, 32 GB and 500 Mbit/s. Load generated by
+    <code>subp2p-explorer</code>'s <code>hold-peers</code>.
+  </footer>
+</div>
+
+<script>
+const D = __DATA__;
+
+const el = (t, a) => { const n = document.createElementNS("http://www.w3.org/2000/svg", t);
+  for (const k in a) n.setAttribute(k, a[k]); return n; };
+const fmt = (v, d = 1) => (v > 0 ? "+" : "") + v.toFixed(d);
+
+function ticks(lo, hi, n) {
+  const raw = (hi - lo) / n, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => s >= raw) || 10 * mag;
+  const out = []; for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) out.push(+v.toFixed(6));
+  return out;
+}
+
+function frame(svg, b, xt, yt, xl, yl, xf, yf) {
+  // plotly-style plot area: tinted background under everything, white grid over it
+  svg.insertBefore(el("rect", { x: b.l, y: b.t, width: b.w, height: b.h, style: "fill:var(--plot)" }), svg.firstChild);
+  yt.forEach(v => {
+    svg.appendChild(el("line", { x1: b.l, x2: b.l + b.w, y1: b.y(v), y2: b.y(v), class: v === 0 ? "zero-line" : "grid-line" }));
+    const t = el("text", { x: b.l - 9, y: b.y(v) + 3.5, class: "tick", "text-anchor": "end" });
+    t.textContent = yf(v); svg.appendChild(t);
+  });
+  xt.forEach(v => {
+    svg.appendChild(el("line", { x1: b.x(v), x2: b.x(v), y1: b.t, y2: b.t + b.h, class: "grid-line" }));
+    const t = el("text", { x: b.x(v), y: b.t + b.h + 18, class: "tick", "text-anchor": "middle" });
+    t.textContent = xf(v); svg.appendChild(t);
+  });
+  svg.appendChild(el("line", { x1: b.l, x2: b.l + b.w, y1: b.t + b.h, y2: b.t + b.h, class: "axis-line" }));
+  const ax = el("text", { x: b.l + b.w / 2, y: b.t + b.h + 40, class: "axis-title", "text-anchor": "middle" });
+  ax.textContent = xl; svg.appendChild(ax);
+  const ay = el("text", { x: 0, y: 0, class: "axis-title", "text-anchor": "middle",
+    transform: `translate(${b.l - 46},${b.t + b.h / 2}) rotate(-90)` });
+  ay.textContent = yl; svg.appendChild(ay);
+}
+
+function hook(host, tip, node, html) {
+  node.style.cursor = "crosshair";
+  const show = (e) => {
+    tip.innerHTML = html; tip.classList.add("on");
+    const r = host.getBoundingClientRect();
+    let x = e.clientX - r.left + 12, y = e.clientY - r.top - 12;
+    if (x + tip.offsetWidth > r.width) x = e.clientX - r.left - tip.offsetWidth - 12;
+    tip.style.left = x + "px"; tip.style.top = y + "px";
+  };
+  node.addEventListener("mousemove", show);
+  node.addEventListener("mouseenter", show);
+  node.addEventListener("mouseleave", () => tip.classList.remove("on"));
+}
+
+function legend(id, items) {
+  const box = document.getElementById(id); box.innerHTML = "";
+  items.forEach(it => {
+    const s = document.createElement("span"); s.className = "lg";
+    s.innerHTML = it.dash
+      ? `<span class="sw dash" style="--sw-c:${it.c}"></span>${it.t}`
+      : `<span class="sw ${it.bar ? "sq" : ""}" style="background:${it.c}"></span>${it.t}`;
+    box.appendChild(s);
+  });
+}
+
+/* ---------- KPI row ---------- */
+(function () {
+  const at2000 = D.peerRuns.filter(r => r.peers === 2000).map(r => fmt(r.drift));
+  const kpis = [
+    { k: "Chain drift at 2000", v: "≤ 0 s", n: `kept pace in all four runs: ${at2000.join(", ")} s` },
+    { k: "Measured threshold", v: "3500–4250", n: "peers held before block import loses ground — no overlap between the groups" },
+    { k: "Margin", v: "~2×", n: "from the recommended 2000 to the first degraded count" },
+    { k: "Cost of 100 → 2000", v: "~60 KB/peer", n: "≈ +115 MB of connection memory, plus +30% of one core" },
+  ];
+  document.getElementById("kpis").innerHTML = kpis.map(x =>
+    `<div class="kpi"><div class="k">${x.k}</div><div class="v">${x.v}</div><div class="n">${x.n}</div></div>`).join("");
+})();
+
+/* ---------- 1. the threshold ---------- */
+(function () {
+  const svg = document.getElementById("c-threshold"), host = svg.parentElement, tip = document.getElementById("t-threshold");
+  const b = { l: 68, t: 18, w: 838, h: 300 };
+  const xmin = 0, xmax = 5300, ymin = -20, ymax = 28;
+  b.x = v => b.l + (v - xmin) / (xmax - xmin) * b.w;
+  b.y = v => b.t + b.h - (v - ymin) / (ymax - ymin) * b.h;
+
+  svg.appendChild(el("rect", { x: b.x(3500), y: b.t, width: b.x(4250) - b.x(3500), height: b.h, style: "fill:var(--band)" }));
+  const bl = el("text", { x: (b.x(3500) + b.x(4250)) / 2, y: b.t + 13, class: "band-label", "text-anchor": "middle" });
+  bl.textContent = "threshold"; svg.appendChild(bl);
+
+  frame(svg, b, [0, 1000, 2000, 3000, 4000, 5000], ticks(ymin, ymax, 5),
+    "light peers held", "chain drift (s)", v => v.toLocaleString("en-US"), v => v + "s");
+
+  const seen = {};                                    // offset runs with identical (peers, drift)
+  D.peerRuns.forEach(r => {
+    const bad = r.peers >= 4250, c = bad ? "var(--s2)" : "var(--s1)";
+    const off = r.drift > ymax;                       // the stall is clamped to the top edge
+    const key = r.peers + ":" + r.drift, dup = seen[key] || 0; seen[key] = dup + 1;
+    const cx = b.x(r.peers) + dup * 11, cy = b.y(off ? ymax : r.drift);
+    const g = el("g", {});
+    if (bad) {
+      const k = 6.4;
+      g.appendChild(el("polygon", { points: `${cx},${cy - k} ${cx + k},${cy} ${cx},${cy + k} ${cx - k},${cy}`,
+        style: `fill:${c};stroke:var(--surface)`, "stroke-width": 2 }));
+    } else {
+      g.appendChild(el("circle", { cx, cy, r: 6, style: `fill:${c};stroke:var(--surface)`, "stroke-width": 2 }));
+    }
+    if (off) {
+      g.appendChild(el("path", { d: `M${cx - 5},${cy - 11} L${cx},${cy - 17} L${cx + 5},${cy - 11}`,
+        style: `fill:none;stroke:${c}`, "stroke-width": 2, "stroke-linecap": "round", "stroke-linejoin": "round" }));
+      const t = el("text", { x: cx - 13, y: cy - 12, class: "mark-label", "text-anchor": "end" });
+      t.textContent = fmt(r.drift, 1) + " s — no import for 135 s"; svg.appendChild(t);
+    }
+    svg.appendChild(g);
+    hook(host, tip, g, `<b>${r.run}</b><br>${r.peers.toLocaleString("en-US")} peers · ${fmt(r.drift)} s`
+      + (off ? " (off scale)" : "") + `<br>${r.blocks} blocks in ${r.window} s`);
+  });
+
+  legend("l-threshold", [{ c: "var(--s1)", t: "keeps pace (≤ 3500 peers)" }, { c: "var(--s2)", t: "loses ground (≥ 4250 peers)" }]);
+})();
+
+/* ---------- 2. cost ---------- */
+function costChart(svgId, tipId, key, unit, yl) {
+  const svg = document.getElementById(svgId), host = svg.parentElement, tip = document.getElementById(tipId);
+  const b = { l: 54, t: 14, w: 380, h: 180 };
+  const vals = D.peerRuns.map(r => r[key]);
+  const ymin = 0, ymax = Math.max(...vals) * 1.14;
+  b.x = v => b.l + v / 5300 * b.w;
+  b.y = v => b.t + b.h - (v - ymin) / (ymax - ymin) * b.h;
+  frame(svg, b, [0, 2000, 4000], ticks(ymin, ymax, 4), "light peers held", yl,
+    v => v ? v / 1000 + "k" : "0", v => v);
+  D.peerRuns.forEach(r => {
+    const c = el("circle", { cx: b.x(r.peers), cy: b.y(r[key]), r: 5, style: `fill:var(--s1);stroke:var(--surface)`, "stroke-width": 2 });
+    svg.appendChild(c);
+    hook(host, tip, c, `<b>${r.run}</b><br>${r.peers.toLocaleString("en-US")} peers · ${r[key]}${unit}`);
+  });
+}
+
+/* ---------- 3. long runs ---------- */
+(function () {
+  const svg = document.getElementById("c-long"), host = svg.parentElement, tip = document.getElementById("t-long");
+  const b = { l: 68, t: 18, w: 838, h: 224 };
+  const series = [
+    { k: "peers-6h", t: "6 h · 2000 peers only", c: "var(--s1)" },
+    { k: "soak-6h", t: "6 h · 2000 peers + serving mix", c: "var(--s2)", dash: "7 4" },
+    { k: "soak-12h", t: "12 h · 2000 peers + serving mix", c: "var(--s3)" },
+  ].filter(s => (D.traces[s.k] || []).length > 1);
+  const all = series.flatMap(s => D.traces[s.k]);
+  const tmax = Math.max(...all.map(p => p[0])), lim = Math.max(12, ...all.map(p => Math.abs(p[1]))) * 1.25;
+  b.x = v => b.l + v / tmax * b.w;
+  b.y = v => b.t + b.h - (v + lim) / (2 * lim) * b.h;
+  svg.appendChild(el("rect", { x: b.l, y: b.y(6), width: b.w, height: b.y(-6) - b.y(6),
+    style: "fill:var(--floor)" }));
+  const fl = el("text", { x: b.l + b.w - 9, y: b.y(-6) - 7, class: "band-label", "text-anchor": "end" });
+  fl.textContent = "±1 block — measurement floor"; svg.appendChild(fl);
+  frame(svg, b, ticks(0, tmax, 6), ticks(-lim, lim, 4), "hours into run", "chain drift (s)",
+    v => (v / 3600).toFixed(0) + "h", v => fmt(v, 0));
+  series.forEach(s => {
+    const pts = D.traces[s.k];
+    svg.appendChild(el("path", { d: pts.map((p, i) => (i ? "L" : "M") + b.x(p[0]) + "," + b.y(p[1])).join(" "),
+      style: `fill:none;stroke:${s.c}` + (s.dash ? `;stroke-dasharray:${s.dash}` : ""),
+      "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+    const last = pts[pts.length - 1];
+    svg.appendChild(el("circle", { cx: b.x(last[0]), cy: b.y(last[1]), r: 4.5, style: `fill:${s.c};stroke:var(--surface)`, "stroke-width": 2 }));
+    pts.forEach(p => {
+      const h = el("circle", { cx: b.x(p[0]), cy: b.y(p[1]), r: 9, fill: "transparent" });
+      svg.appendChild(h);
+      hook(host, tip, h, `<b>${s.t}</b><br>${(p[0] / 3600).toFixed(1)} h · ${fmt(p[1])} s`);
+    });
+  });
+  legend("l-long", series.map(s => ({ c: s.c, t: s.t, bar: !s.dash, dash: !!s.dash })));
+
+  document.getElementById("longkpis").innerHTML = D.longRuns.filter(l => l.drift !== null).map(l =>
+    `<div class="kpi"><div class="k">${l.label} · ${l.load}</div><div class="v">${fmt(l.drift)} s</div>
+     <div class="n">over ${l.hours} h · node CPU ${l.cpu}% mean${l.load.includes("mix") ? ", incl. the peers-only tail" : ""}</div></div>`).join("");
+})();
+
+/* ---------- 3b. memory over the long runs ---------- */
+(function () {
+  const svg = document.getElementById("c-rsstrace"), host = svg.parentElement, tip = document.getElementById("t-rsstrace");
+  const series = [
+    { k: "peers-6h", t: "6 h · 2000 peers only", c: "var(--s1)" },
+    { k: "soak-6h", t: "6 h · 2000 peers + serving mix", c: "var(--s2)", dash: "7 4" },
+    { k: "soak-12h", t: "12 h · 2000 peers + serving mix", c: "var(--s3)" },
+  ].filter(s => (D.rss[s.k] || []).length > 1)
+   .map(s => ({ ...s, pts: D.rss[s.k].map(p => [p[0], p[1] - D.rss[s.k][0][1]]) }));
+  const all = series.flatMap(s => s.pts);
+  const tmax = Math.max(...all.map(p => p[0]));
+  const ymin = Math.min(0, ...all.map(p => p[1])) * 1.15;
+  const ymax = Math.max(...all.map(p => p[1])) * 1.12 || 100;
+  const b = { l: 68, t: 18, w: 838, h: 236 };
+  b.x = v => b.l + v / tmax * b.w;
+  b.y = v => b.t + b.h - (v - ymin) / (ymax - ymin) * b.h;
+  frame(svg, b, ticks(0, tmax, 6), ticks(ymin, ymax, 5), "hours into run", "ΔRSS since run start (MB)",
+    v => (v / 3600).toFixed(0) + "h", v => fmt(v, 0));
+  series.forEach((s, si) => {
+    svg.appendChild(el("path", { d: s.pts.map((p, i) => (i ? "L" : "M") + b.x(p[0]) + "," + b.y(p[1])).join(" "),
+      style: `fill:none;stroke:${s.c}` + (s.dash ? `;stroke-dasharray:${s.dash}` : ""),
+      "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+    const last = s.pts[s.pts.length - 1];
+    svg.appendChild(el("circle", { cx: b.x(last[0]), cy: b.y(last[1]), r: 4.5, style: `fill:${s.c};stroke:var(--surface)`, "stroke-width": 2 }));
+    // first series labels below its endpoint, the rest above — their endpoints can sit close
+    const t = el("text", { x: b.x(last[0]) - 8, y: b.y(last[1]) + (si === 0 ? 19 : -9), class: "mark-label", "text-anchor": "end" });
+    t.textContent = fmt(last[1], 0) + " MB"; svg.appendChild(t);
+    s.pts.forEach(p => {
+      const h = el("circle", { cx: b.x(p[0]), cy: b.y(p[1]), r: 9, fill: "transparent" });
+      svg.appendChild(h);
+      hook(host, tip, h, `<b>${s.t}</b><br>${(p[0] / 3600).toFixed(1)} h · ${fmt(p[1], 0)} MB since start`);
+    });
+  });
+  legend("l-rsstrace", series.map(s => ({ c: s.c, t: s.t, bar: !s.dash, dash: !!s.dash })));
+})();
+
+/* ---------- 4. mix ---------- */
+(function () {
+  const svg = document.getElementById("c-mix"), host = svg.parentElement, tip = document.getElementById("t-mix");
+  const b = { l: 68, t: 18, w: 838, h: 164 };
+  const lim = 9;
+  const n = D.mixRuns.length;
+  b.y = v => b.t + b.h - (v + lim) / (2 * lim) * b.h;
+  const slot = b.w / 6;
+  svg.appendChild(el("rect", { x: b.l, y: b.y(6), width: b.w, height: b.y(-6) - b.y(6),
+    style: "fill:var(--floor)" }));
+  const fl = el("text", { x: b.l + 9, y: b.y(-6) + 12, class: "band-label" });
+  fl.textContent = "±1 block — measurement floor"; svg.appendChild(fl);
+  frame(svg, b, [], ticks(-lim, lim, 4), "run pair (alternating, in order)", "chain drift (s)",
+    v => v, v => fmt(v, 0));
+  [1, 2, 3, 4, 5, 6].forEach(i => {
+    const t = el("text", { x: b.l + slot * (i - .5), y: b.t + b.h + 18, class: "tick", "text-anchor": "middle" });
+    t.textContent = "#" + i; svg.appendChild(t);
+  });
+  D.mixRuns.forEach(r => {
+    const base = r.kind === "base";
+    const cx = b.l + slot * (r.i - .5) + (base ? -13 : 13);
+    const c = base ? "var(--s1)" : "var(--s2)";
+    const g = el("g", {});
+    if (base) g.appendChild(el("circle", { cx, cy: b.y(r.drift), r: 6, style: `fill:${c};stroke:var(--surface)`, "stroke-width": 2 }));
+    else {
+      const s = 6.4, cy = b.y(r.drift);
+      g.appendChild(el("polygon", { points: `${cx},${cy - s} ${cx + s},${cy} ${cx},${cy + s} ${cx - s},${cy}`,
+        style: `fill:${c};stroke:var(--surface)`, "stroke-width": 2 }));
+    }
+    svg.appendChild(g);
+    hook(host, tip, g, `<b>${r.run}</b><br>${fmt(r.drift)} s · node CPU ${r.cpu}%`);
+  });
+  const mean = k => { const v = D.mixRuns.filter(r => r.kind === k).map(r => r.drift); return v.reduce((a, x) => a + x, 0) / v.length; };
+  legend("l-mix", [
+    { c: "var(--s1)", t: `2000 peers only — mean ${fmt(mean("base"))} s` },
+    { c: "var(--s2)", t: `2000 peers + serving mix — mean ${fmt(mean("mix"))} s` },
+  ]);
+})();
+
+/* ---------- tables ---------- */
+(function () {
+  // peers / drift / verdict lead, so the answer is readable before any sideways scroll
+  const t = document.getElementById("tbl-peers");
+  t.innerHTML = "<thead><tr><th>run</th><th>peers</th><th>drift</th><th>held</th>"
+    + "<th>blocks</th><th>window</th><th>coverage</th><th>spread p50/p99/max</th><th>refused</th>"
+    + "<th>evicted</th><th>finality lag mean/max</th><th>fds peak</th><th>ramp ΔRSS</th><th>RSS peak</th><th>CPU</th></tr></thead><tbody>"
+    + D.peerRuns.map(r => {
+      const bad = r.peers >= 4250;
+      return `<tr><td>${r.run}</td><td>${r.peers.toLocaleString("en-US")}</td>`
+        + `<td class="${bad ? "flag" : ""}">${fmt(r.drift)} s</td>`
+        + `<td>${r.held.toLocaleString("en-US")}</td><td>${r.blocks}</td><td>${r.window} s</td>`
+        + `<td>${r.coverage}%</td><td>${r.spread50} / ${r.spread99} / ${r.spreadMax} ms</td><td>${r.refused}</td><td>${r.evicted}</td>`
+        + `<td>${r.finlag_mean} / ${r.finlag_max} blk</td><td>${r.fds.toLocaleString("en-US")}</td>`
+        + `<td>+${r.rampRss} MB</td><td>${r.rss.toLocaleString("en-US")} MB</td><td>${r.cpu}%</td></tr>`;
+    }).join("") + "</tbody>";
+
+  const l = document.getElementById("tbl-long");
+  l.innerHTML = "<thead><tr><th>run</th><th>load</th><th>duration</th><th>drift</th><th>node CPU</th><th>RSS start</th><th>RSS peak</th></tr></thead><tbody>"
+    + D.longRuns.map(r => `<tr><td>${r.run}</td><td>${r.load}</td><td>${r.hours} h</td>`
+      + `<td>${r.drift === null ? "<span style='color:var(--ink-3)'>running…</span>" : fmt(r.drift) + " s"}</td>`
+      + `<td>${r.cpu}%</td><td>${r.rss0.toLocaleString("en-US")} MB</td><td>${r.rssMax.toLocaleString("en-US")} MB</td></tr>`).join("")
+    + D.mixRuns.map(r => `<tr><td>${r.run}</td><td>${r.kind === "base" ? "peers only" : "peers + mix"}</td><td>300 s</td>`
+      + `<td>${fmt(r.drift)} s</td><td>${r.cpu}%</td><td>—</td><td>—</td></tr>`).join("")
+    + "</tbody>";
+})();
+
+costChart("c-cpu", "t-cpu", "cpu", "% of one core", "% of one core");
+costChart("c-rss", "t-rss", "rampRss", " MB", "ramp ΔRSS (MB)");
+</script>
