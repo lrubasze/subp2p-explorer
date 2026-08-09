@@ -173,12 +173,13 @@
     <div class="head">
       <div class="eyebrow">Primary result · 17 runs · 300 s each</div>
       <h2>The threshold sits between 3500 and 4250 peers</h2>
-      <p class="prose">Each point is one run. During a run the node imports a stretch of blocks,
-      and their on-chain timestamps say how much chain time that stretch covers.
-      <strong>Chain drift</strong> is wall-clock elapsed minus that chain time: a node keeping
-      pace imports 300 s worth of blocks in 300 s (drift ≈ 0); a drift of +12 s means it ended
-      the run 12 s further behind the chain head than it started; negative means it caught up.
-      There is no overlap between the two groups.</p>
+      <p class="prose"><strong>The test:</strong> open N connections that complete the
+      block-announces handshake as light peers, then hold their slots silently for 300 s while
+      the node follows Kusama; the node's own metrics are sampled every 5 s. One run per data
+      point, N from 100 to 5000, repeated at the interesting counts. The gate
+      (<code>--in-peers-light</code>) is parked at 5000 in every run, so the variable is N —
+      the peers the node actually holds. Three things are watched: whether the node keeps up
+      with the chain (chain drift), and what holding costs (CPU, RSS).</p>
     </div>
     <div class="card">
       <div class="chart-host">
@@ -187,24 +188,13 @@
         <div class="tip" id="t-threshold"></div>
       </div>
       <div class="legend" id="l-threshold"></div>
-      <div class="card-note">Resolution is one block (~6 s) over a 300 s window, since Kusama
+      <div class="card-note"><strong>Chain drift</strong> — wall-clock elapsed minus the chain
+      time covered by the blocks the node imported (from their on-chain timestamps): ≈0 means it
+      kept pace, positive means it fell that much further behind the head, negative means it
+      caught up. Each point is one run. Resolution is one block (~6 s) over a 300 s window, since Kusama
       block timestamps are 6 s apart. The gap between the groups is 2.2 blocks — comfortably
       wider than that floor. The 5000-peer stall is clamped to the top of the axis at its
       true value of +138.4 s, so the other sixteen runs stay readable.</div>
-    </div>
-  </section>
-
-  <!-- ============ COST ============ -->
-  <section id="sec-cost">
-    <div class="head">
-      <div class="eyebrow">What it costs — and what never moved</div>
-      <h2>Holding peers is cheap</h2>
-      <p class="prose">Two separate measures, two separate charts. Going from the current
-      default of 100 to 2000 costs roughly <strong>+535 MB and +30% of one core</strong>.
-      Everything else stayed flat at every count: <strong>0 peers refused, 0 evicted</strong>
-      (up to 5000 — the gate is an arbitrary constant, not a capacity limit), 100%
-      announcement coverage, finalization tracking import within 5 blocks, and at most
-      6220 file descriptors against a 131k limit.</p>
     </div>
     <div class="two">
       <div class="card">
@@ -222,20 +212,47 @@
         </div>
       </div>
     </div>
+    <div class="prose">
+      <h3 style="margin-bottom:8px">Reading the three charts</h3>
+      <ul class="tight">
+        <li><strong>Chain drift</strong> is flat up to 3500 peers (−13.0…+1.4 s); every run at
+        4250 or more loses ground (+7.1…+138.4 s). No overlap — the threshold is between 3500
+        and 4250 held peers.</li>
+        <li><strong>CPU</strong> rises smoothly from 46% of one core at 100 peers to ~105% at
+        5000 — holding is cheap, and CPU is clearly not what fails first.</li>
+        <li><strong>RSS</strong> costs ≈0.28 MB per held peer — about +535 MB going from the
+        current default of 100 to 2000.</li>
+        <li><strong>The gate itself never binds:</strong> 0 refused, 0 evicted, 100% announcement
+        delivery at every count. The node takes every peer offered; what degrades first is
+        keeping up with the chain.</li>
+        <li><strong>Candidate: 2000</strong> — flat across four runs, ~2× below the threshold.
+        The long-term test below runs at this count.</li>
+      </ul>
+    </div>
   </section>
 
   <!-- ============ LONG RUN ============ -->
   <section id="sec-long">
     <div class="head">
-      <div class="eyebrow">Secondary check · 2000 peers held for hours</div>
-      <h2>It holds over long runs, and under heavy serving load</h2>
-      <p class="prose">The 300 s runs answer where the threshold is. These answer whether 2000 stays
-      safe over time — and whether it survives a node that is also busy serving light-client
-      requests. The <strong>serving mix</strong> is that request load: while holding the peers, the
-      node also answers runtime-call proofs at 2000/s and runtime-code reads at 345/s (both
-      <code>/light/2</code>) plus warp-sync proofs at 13/s (<code>/sync/warp</code>) — each about
-      half of what it can serve solo. Every sample stays within two blocks of zero and 96% within
-      one — the sawtooth <em>is</em> that quantisation, not the node moving.</p>
+      <div class="eyebrow">Long-term test · the candidate default</div>
+      <h2>2000 peers, held for hours</h2>
+      <p class="prose">Three long runs put the candidate through time, alone and while the node
+      is also busy serving light clients:</p>
+      <ul class="tight prose">
+        <li><strong>6 h · peers only</strong> — 2000 held peers, no request load</li>
+        <li><strong>6 h · peers + serving mix</strong> — the same 2000 peers while the node also
+        serves requests</li>
+        <li><strong>12 h · peers + serving mix</strong> — the same, for twice as long</li>
+      </ul>
+      <p class="prose">The <strong>serving mix</strong>, each leg at roughly half of what the
+      node can serve solo:</p>
+      <ul class="tight prose">
+        <li>runtime-call proofs at 2000/s (<code>/light/2</code>)</li>
+        <li>runtime-code (<code>:code</code>) read proofs at 345/s (<code>/light/2</code>)</li>
+        <li>warp-sync proofs at 13/s (<code>/sync/warp</code>)</li>
+      </ul>
+      <p class="prose">Every sample below stays within two blocks of zero and 96% within one —
+      the sawtooth <em>is</em> the one-block quantisation, not the node moving.</p>
     </div>
     <div class="card">
       <div class="chart-host">
