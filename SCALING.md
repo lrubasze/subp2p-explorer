@@ -128,6 +128,56 @@ run cannot resolve better than ±6 s, which is what produces the bimodal ~0/~±6
 pattern above in *both* conditions. Longer windows, not more repeats, are what buy
 precision.
 
+## Sustained load — 6 h and 12 h
+
+Same mix, run long: 2000 held peers (remote) plus all three legs on loopback, then a
+1 h peers-only recovery tail.
+
+| | 6 h run | 12 h run |
+|---|---|---|
+| load / tail | 5 h + 1 h | 11 h + 1 h |
+| **chain deficit** | **+1.5 s** (0.007%) | **−0.6 s** (−0.001%) |
+| peers held | 2000/2000 | 2000/2000 |
+| node CPU under load | 475% | 471–480% |
+| calls served | 34,890,505 (3.1% shed) | 76,431,693 (3.5% shed) |
+| reads served | 6,011,711 (3.2% shed) | 13,411,291 (1.8% shed) |
+| **warp proofs** | **233,999 — 0 failures** | **514,799 — 0 failures** |
+| bytes served | ~7 TB | **~29.7 TB** |
+
+**The node keeps pace indefinitely at this load.** Over 12 h it tracked the chain to
+within 0.6 s across 6974 blocks — a tenth of one block, an order of magnitude below
+the quantisation floor.
+
+**Warp serving is flawless under sustained load.** 748,798 proofs across both runs
+with zero shed, zero timeout, zero error, zero aborted, holding 103.81 MiB/s
+throughout. The node's own counter agrees with the client to within 1–2 requests
+(+234,001 vs 233,999; +514,800 vs 514,799).
+
+**Light-leg latency roughly doubles under the mix** but stays stable: calls p50
+5.9 ms (2.1 ms solo), reads p50 11.7 ms (12.2 ms solo). Shed sits at 2–4% and does
+not climb over 11 h.
+
+### RSS does not plateau
+
+| | h0 | h3 | h7 | h10 | tail |
+|---|---|---|---|---|---|
+| 6 h run | 4361 | 5495 | — | — | 5118 MB |
+| 12 h run | 5358 | 6127 | 7143 | **7213** | 6859–6917 MB |
+
+The 6 h run looked like a cache filling toward an asymptote: growth decelerated from
++218 to +80 MB per 20 min, there was a −148 MB release mid-run, and the tail gave
+back **−670 MB** and went flat within 15 minutes.
+
+**Twelve hours does not support that reading.** Growth continued at ~150 MB/h and
+was still rising at h10, and the tail returned only ~350 MB. Across both runs — ~18 h
+of near-continuous load — RSS went 4175 → ~6900 MB. At that rate it would be ~25 GB
+in a week, which matters on a 32 GB reference machine.
+
+Two things to hold in mind before treating it as a leak: this is load no real node
+sees (13.4 M reads of a 1.7 MB blob, 515 K full warp proofs), and **peers-only RSS
+was ~1806 MB**, so essentially none of this is peer-related. It is a serving
+observation. Unresolved.
+
 ## Open
 
 - Reads (~1.09 GiB/s of near-pure copy — 772 B of trie nodes around a 1.7 MB blob)
@@ -137,7 +187,11 @@ precision.
   at 20), and node CPU accounting supports the per-proof cost: (234−82)% ÷ 25.9/s =
   **59 ms**, and (183−82)% ÷ 13/s = **78 ms** of node CPU per proof. What is *not*
   separable is worker count from per-worker service time.
-- Whether the per-leg shedding above is real contention.
+- Whether the per-leg shedding above is real contention (2-4% under sustained load,
+  stable over 11 h).
+- **Why RSS does not plateau under sustained serving load** (~150 MB/h at h10 of the
+  12 h run, only ~350 MB returned when load stopped). Not peer-related; needs a
+  heap profile rather than more soak time.
 - `enp65s0f1` is DOWN on both hosts — a 10 GbE direct link if brought up, which
   would let the mix run without the generator competing for the node's cores.
 
