@@ -149,9 +149,9 @@
   <header class="head prose">
     <div class="eyebrow">polkadot-sdk · network · light peers</div>
     <h1>How many light peers can a full node actually hold?</h1>
-    <p class="lede">The default for <code>--in-peers-light</code> is 100. Measured against a
-    Kusama full node on reference-class hardware, the node holds 3500 with no effect on block
-    import and first loses ground somewhere between 3500 and 4250.</p>
+    <p class="lede">The default for <code>--in-peers-light</code> is 100. We measured a real
+    Kusama full node on hardware close to the reference spec: it holds 3500 light peers with
+    no effect on block import, and starts falling behind somewhere between 3500 and 4250.</p>
   </header>
 
   <div class="verdict">
@@ -173,13 +173,13 @@
     <div class="head">
       <div class="eyebrow">Primary result · 17 runs · 300 s each</div>
       <h2>The threshold sits between 3500 and 4250 peers</h2>
-      <p class="prose"><strong>The test:</strong> open N connections that complete the
-      block-announces handshake as light peers, then hold their slots silently for 300 s while
-      the node follows Kusama; the node's own metrics are sampled every 5 s. One run per data
-      point, N from 100 to 5000, repeated at the interesting counts. The gate
-      (<code>--in-peers-light</code>) is parked at 5000 in every run, so the variable is N —
-      the peers the node actually holds. Three things are watched: whether the node keeps up
-      with the chain (chain drift), and what holding costs (CPU, RSS).</p>
+      <p class="prose"><strong>The test:</strong> connect N light peers to the node and keep them
+      connected for 300 seconds while the node follows Kusama. The peers do nothing — they only
+      hold their slots. We read the node's own metrics every 5 seconds. One run per data point,
+      N from 100 to 5000, with repeats at the interesting counts. The node's limit
+      (<code>--in-peers-light</code>) was set to 5000 in every run, so what varies is N — the
+      number of peers the node actually holds. We watch three things: does the node keep up
+      with the chain (chain drift), and what does holding cost (CPU, memory).</p>
     </div>
     <div class="card">
       <div class="chart-host">
@@ -188,13 +188,13 @@
         <div class="tip" id="t-threshold"></div>
       </div>
       <div class="legend" id="l-threshold"></div>
-      <div class="card-note"><strong>Chain drift</strong> — wall-clock elapsed minus the chain
-      time covered by the blocks the node imported (from their on-chain timestamps): ≈0 means it
-      kept pace, positive means it fell that much further behind the head, negative means it
-      caught up. Each point is one run. Resolution is one block (~6 s) over a 300 s window, since Kusama
-      block timestamps are 6 s apart. The gap between the groups is 2.2 blocks — comfortably
-      wider than that floor. The 5000-peer stall is clamped to the top of the axis at its
-      true value of +138.4 s, so the other sixteen runs stay readable.</div>
+      <div class="card-note"><strong>Chain drift</strong>: how many seconds the node fell behind
+      the chain during the run. Two clocks are compared — how much real time passed, and how
+      much chain time the imported blocks cover (from their on-chain timestamps). 0 = kept up;
+      +12 s = ended the run 12 s further behind than it started; negative = caught up. Each
+      point is one run. The metric only resolves whole blocks (~6 s), and the gap between the
+      two groups is 2.2 blocks — clearly wider than that. The 5000-peer stall (+138.4 s) is
+      drawn at the top edge so the other sixteen runs stay readable.</div>
     </div>
     <div class="two">
       <div class="card">
@@ -205,11 +205,11 @@
         </div>
       </div>
       <div class="card">
-        <div class="card-head"><h3>Connection memory</h3><div class="card-note">ΔRSS from run start to
-        t=120 s, when all peers are connected (MB) — isolates what the connections cost from the
-        node's uptime memory growth, since runs were not separated by restarts. Below ~1000 peers
-        the jump is smaller than the node's normal 2-minute RSS fluctuation, so the low-count
-        points are noise.</div></div>
+        <div class="card-head"><h3>Connection memory</h3><div class="card-note">How much the node's memory jumps
+        while the peers connect (run start → t=120 s, MB). This isolates the cost of the
+        connections themselves — the node's memory also grows slowly on its own, and runs were
+        not separated by restarts. Below ~1000 peers the jump is smaller than normal 2-minute
+        noise, so the left-most points mean little.</div></div>
         <div class="chart-host">
           <svg id="c-rss" viewBox="0 0 460 260" role="img" aria-label="Connection memory grows near-linearly with peer count, about 60 KB per peer, reaching 350 MB at 5000 peers."></svg>
           <div class="tip" id="t-rss"></div>
@@ -219,19 +219,19 @@
     <div class="prose">
       <h3 style="margin-bottom:8px">Reading the three charts</h3>
       <ul class="tight">
-        <li><strong>Chain drift</strong> is flat up to 3500 peers (−13.0…+1.4 s); every run at
-        4250 or more loses ground (+7.1…+138.4 s). No overlap — the threshold is between 3500
-        and 4250 held peers.</li>
-        <li><strong>CPU</strong> rises smoothly from 46% of one core at 100 peers to ~105% at
-        5000 — holding is cheap, and CPU is clearly not what fails first.</li>
-        <li><strong>Memory</strong> costs ~45–70 KB per held peer, measured as the RSS jump while
-        the peers connect — about +115 MB going from the current default of 100 to 2000. (Comparing
-        whole runs instead overstates this ~4–5×, because the node's RSS also grows with uptime —
+        <li><strong>Chain drift</strong>: flat up to 3500 peers (−13.0…+1.4 s). Every run at
+        4250 or more falls behind (+7.1…+138.4 s). No overlap — the limit is somewhere between
+        3500 and 4250 held peers.</li>
+        <li><strong>CPU</strong>: 46% of one core at 100 peers, ~105% at 5000. Cheap — CPU is
+        not what fails first.</li>
+        <li><strong>Memory</strong>: ~45–70 KB per held peer, measured as the jump while the
+        peers connect — about +115 MB for going from 100 to 2000. (Comparing whole runs instead
+        gives a ~4–5× higher number, because the node's memory also grows slowly with uptime —
         see the memory chart in the next section.)</li>
-        <li><strong>The gate itself never binds:</strong> 0 refused, 0 evicted, 100% announcement
-        delivery at every count. The node takes every peer offered; what degrades first is
-        keeping up with the chain.</li>
-        <li><strong>Candidate: 2000</strong> — flat across four runs, ~2× below the threshold.
+        <li><strong>The limit itself never does anything:</strong> 0 peers refused, 0 evicted,
+        every announcement delivered, at every count. The node accepts every peer offered; what
+        breaks first is keeping up with the chain.</li>
+        <li><strong>Candidate: 2000</strong> — flat in all four runs, about half the threshold.
         The long-term test below runs at this count.</li>
       </ul>
     </div>
@@ -250,15 +250,16 @@
         serves requests</li>
         <li><strong>12 h · peers + serving mix</strong> — the same, for twice as long</li>
       </ul>
-      <p class="prose">The <strong>serving mix</strong>, each leg at roughly half of what the
-      node can serve solo:</p>
+      <p class="prose">The <strong>serving mix</strong>, each part at about half of what the node
+      can serve at most:</p>
       <ul class="tight prose">
         <li>runtime-call proofs at 2000/s (<code>/light/2</code>)</li>
         <li>runtime-code (<code>:code</code>) read proofs at 345/s (<code>/light/2</code>)</li>
         <li>warp-sync proofs at 13/s (<code>/sync/warp</code>)</li>
       </ul>
-      <p class="prose">Every sample below stays within two blocks of zero and 96% within one —
-      the sawtooth <em>is</em> the one-block quantisation, not the node moving.</p>
+      <p class="prose">In the chart below, every sample stays within two blocks of zero, and 96%
+      within one. The zig-zag is the one-block resolution of the metric — not the node speeding
+      up and slowing down.</p>
     </div>
     <div class="card">
       <div class="chart-host">
@@ -277,12 +278,12 @@
         <div class="tip" id="t-rsstrace"></div>
       </div>
       <div class="legend" id="l-rsstrace"></div>
-      <div class="card-note" id="n-rsstrace">Plotted as growth from each run's start because the
-      absolute levels are not comparable: the node was not restarted between runs, and the
-      serving-mix soaks leave memory behind that a load stop does not return. The peers-only run
-      grows too (~200 MB/h at steady connection counts), so the growth is not attributable to
-      serving alone — it is unattributed pending a heap profile. Block import kept pace
-      throughout every run here.</div>
+      <div class="card-note" id="n-rsstrace">Shown as growth since each run's start, because the
+      absolute levels can't be compared: the node was never restarted between runs, and the
+      serving runs leave memory behind even after the load stops. Note the peers-only run grows
+      too (~200 MB/h, with a steady connection count) — so serving is not the only cause. The
+      real cause is unknown; finding it needs a heap profile. Block import kept up in every run
+      regardless.</div>
     </div>
     <div class="kpis" id="longkpis"></div>
   </section>
@@ -292,10 +293,10 @@
     <div class="head">
       <div class="eyebrow">Secondary check · serving load</div>
       <h2>Serving load does not move the limit</h2>
-      <p class="prose">Six loaded runs alternating with six unloaded baselines, at 2000 peers.
-      The serving mix (calls 2000/s, reads 345/s, warp 13/s — as above) drives the node to
-      <strong>5× the CPU</strong> — and the loaded mean drift comes out <em>lower</em> than the
-      baseline mean.</p>
+      <p class="prose">Six runs with the serving mix on, alternating with six without it, all at
+      2000 peers. The mix (calls 2000/s, reads 345/s, warp 13/s — as above) pushes the node to
+      <strong>5× the CPU</strong> — and the loaded runs' average drift comes out <em>lower</em>
+      than the baseline's.</p>
     </div>
     <div class="card">
       <div class="chart-host">
@@ -304,8 +305,8 @@
         <div class="tip" id="t-mix"></div>
       </div>
       <div class="legend" id="l-mix"></div>
-      <div class="card-note">Both columns land on 0 or ±6 s because the metric is quantised to
-      one block — that pattern is the floor, not a signal.</div>
+      <div class="card-note">Every value lands on 0 or ±6 s because the metric resolves whole
+      blocks — that pattern is the resolution, not a signal.</div>
     </div>
   </section>
 
@@ -314,30 +315,36 @@
     <div class="head">
       <div class="eyebrow">For the record</div>
       <h2>Every run</h2>
+      <p class="prose">What the columns mean:</p>
+      <ul class="tight prose">
+        <li><strong>peers / held</strong> — peers offered to the node, and how many it actually held (peak)</li>
+        <li><strong>drift</strong> — seconds the node fell behind the chain during the run (red = fell behind)</li>
+        <li><strong>blocks / window</strong> — blocks imported during the run, and the run length</li>
+        <li><strong>coverage</strong> — share of block announcements that reached every peer</li>
+        <li><strong>spread p50/p99/max</strong> — for one block, the time between the first and the
+        last peer getting its announcement; p50 is the middle block, p99/max the slowest</li>
+        <li><strong>refused / evicted</strong> — peers the node turned away, or dropped after connecting</li>
+        <li><strong>finality lag</strong> — how many blocks finalization ran behind best</li>
+        <li><strong>fds peak</strong> — open file descriptors of the node process, mostly one TCP
+        socket per peer (limit 131,072)</li>
+        <li><strong>ramp ΔRSS</strong> — memory jump while the peers connect: the per-peer cost</li>
+        <li><strong>RSS peak / CPU</strong> — highest memory and average CPU during the run</li>
+      </ul>
     </div>
     <details open>
       <summary>Peer-count campaign — 17 runs</summary>
       <div class="table-scroll"><table id="tbl-peers"></table></div>
-      <div class="card-note" style="padding:12px 20px 16px">Spread is per block: the time from
-      the first holder receiving its announcement to the last one — how tightly the node fans a
-      block out to all its light peers; p50 is the median block. The 1377.5 / 1836.7 ms tail in
-      <code>light-2000-r2</code> is a single block that fanned out slowly in both its announcement
-      rounds — it still reached all 2000 holders. Spread goes
-      sub-linear above 3500 peers — that is likely an artifact of the measuring client
-      (thousands of swarms in one process), not node truth. Finality lag is
-      <code>best − finalized</code>, a local consistency check: it shrinking during the
-      5000-peer stall means finalization caught up to a pinned best, not that finality
-      was healthy under load. Fds is the node process's peak count of open file
-      descriptors — at these counts nearly all TCP sockets, roughly one per held peer —
-      against a limit of 131,072.</div>
+      <div class="card-note" style="padding:12px 20px 16px">Two caveats. The 1377.5 / 1836.7 ms
+      spread in <code>light-2000-r2</code> is one slow block — it still reached all 2000 peers.
+      And above 3500 peers the spread numbers are suspect: our measuring client runs thousands
+      of peers in one process and is probably the bottleneck there, not the node.</div>
     </details>
     <details>
       <summary>Long runs and serving-load campaign</summary>
       <div class="table-scroll"><table id="tbl-long"></table></div>
-      <div class="card-note" style="padding:12px 20px 16px">RSS start differs per run because
-      the node was never restarted between them: each serving-mix soak leaves behind memory
-      that stopping the load does not return (the peers-only run starts at the level the
-      12 h soak left). Growth since start is the comparable figure — see the memory chart
+      <div class="card-note" style="padding:12px 20px 16px">The RSS start column differs per run
+      because the node was never restarted: each long run starts at whatever level the previous
+      one left behind. Compare the growth, not the absolute numbers — see the memory chart
       above.</div>
     </details>
     <details>
@@ -345,22 +352,22 @@
       <div style="padding:18px 20px 22px;display:flex;flex-direction:column;gap:16px">
         <div class="prose">
           <h3 style="margin-bottom:6px">How degradation is measured</h3>
-          <p>For the blocks a node imported during a run, compare wall-clock elapsed against the
-          on-chain time those blocks span, taken from the Timestamp inherent:
-          <code>drift = wall_elapsed − chain_time_spanned</code>. No anchor, no assumed block
-          time.</p>
-          <p style="margin-top:9px">An earlier version of this analysis extrapolated the expected
-          height from a fixed 6.0 s block time. Kusama does not hold 6.0 s — measured windows ran
-          6.00 to 6.80 — and that method charged the chain's own variation to the node, scoring a
-          500-peer run worse than a 5000-peer run.</p>
+          <p>Two clocks are compared: real time passed during the run, and chain time covered by
+          the blocks the node imported (read from each block's own timestamp):
+          <code>drift = wall_elapsed − chain_time_spanned</code>. Nothing is assumed about how
+          fast the chain makes blocks.</p>
+          <p style="margin-top:9px">An earlier version assumed Kusama makes a block exactly every
+          6.0 s. It does not (measured 6.00–6.80 s), and the wrong assumption produced more fake
+          "lag" than the real signal — it scored a 500-peer run worse than a 5000-peer run.
+          Always compare against real block timestamps.</p>
         </div>
         <div class="prose">
           <h3 style="margin-bottom:6px">Limitations</h3>
           <ul class="tight">
             <li><strong>One machine, one chain, one backend.</strong> Kusama, litep2p. The libp2p backend is untested.</li>
-            <li><strong>RAM was 4× the reference spec</strong> (125 GB vs 32 GB), most of it page cache for a 1.2 TB database. Block import reads state, so a 32 GB machine could threshold lower. This is the least transferable part of the result.</li>
-            <li><strong>Bandwidth was 2× the reference spec.</strong> Irrelevant to peer holding (~250 kB/s at 5000 peers), relevant to serving throughput.</li>
-            <li><strong>Holders are silent and never churn.</strong> Serving load was tested separately; connection turnover was not.</li>
+            <li><strong>Our machine has 4× the reference RAM</strong> (125 vs 32 GB), and most of it caches the 1.2 TB database. Importing blocks reads that data, so a 32 GB machine could fall behind at a lower peer count. This is the weakest part of the result.</li>
+            <li><strong>The network link is 2× the reference.</strong> Doesn't matter for holding peers (~250 kB/s at 5000 peers); matters for serving throughput.</li>
+            <li><strong>Our peers are silent and never disconnect.</strong> Serving load was tested separately; peers coming and going was not.</li>
             <li>Single runs at 100, 200 and 500; the counts near the threshold have 2–4 each.</li>
           </ul>
         </div>
