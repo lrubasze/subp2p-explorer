@@ -540,6 +540,7 @@ pub(crate) fn parse_method_spec(
         // so we only peel a trailing ":<n>" when the whole token isn't a generic form.
         let (name, weight) = if tok.starts_with("call:")
             || tok.starts_with("read:")
+            || tok.starts_with("read_child:")
             || tok.starts_with("revive_dotns:")
         {
             (tok, 1usize)
@@ -1009,6 +1010,34 @@ mod tests {
             main.build(&head, 0),
             "a child read must not encode as a main-trie read"
         );
+    }
+
+    /// The generic forms carry their own colons, so the `:weight` peeler must
+    /// leave them alone. An all-digit key is the case that bites: `rsplit_once`
+    /// would read it as a weight and hand `parse_method` a truncated token.
+    #[test]
+    fn generic_forms_keep_their_colons_out_of_the_weight_suffix() {
+        let (methods, schedule) =
+            parse_method_spec("read_child:aabb:1234").expect("an all-digit child key parses");
+        assert_eq!(schedule.len(), 1, "no weight was peeled");
+        match &methods[0].1 {
+            MethodKind::GenericReadChild { child_trie, keys } => {
+                assert_eq!(child_trie, &vec![0xaa, 0xbb]);
+                assert_eq!(keys, &vec![ReadKey::fixed(vec![0x12, 0x34])]);
+            }
+            other => panic!("expected a child storage read, got {other:?}"),
+        }
+
+        // The same hazard on a main-trie read.
+        let (methods, schedule) = parse_method_spec("read:1234").expect("an all-digit key parses");
+        assert_eq!(schedule.len(), 1);
+        assert_eq!(methods[0].0, "read:1234");
+
+        // Named methods still take a weight.
+        let (methods, schedule) =
+            parse_method_spec("warp_code:3").expect("a weighted preset parses");
+        assert_eq!(methods.len(), 1);
+        assert_eq!(schedule.len(), 3);
     }
 
     /// The missing-argument shapes must fail loudly, not fall through to the
