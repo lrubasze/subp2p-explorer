@@ -270,6 +270,24 @@ pub struct SpamLightOpts {
     /// or a bare runtime-API name (no args, e.g. Core_version). Defaults to the
     /// chain preset, else account_nonce.
     ///
+    /// Any read key may be written "<hexprefix>:rand[N]" to append N fresh
+    /// random bytes per request (N defaults to 32). Use it for small reads: a
+    /// fixed key is a node-cache hit after the first request, which measures
+    /// re-answering one cached lookup rather than serving reads. Note a random
+    /// key is an absence proof, so it walks the trie honestly but returns fewer
+    /// bytes than a hit.
+    ///
+    /// "read_child:<hex trie_id>:<hexkey>[+<hexkey>…]" reads from a child trie
+    /// (RemoteReadChildRequest) instead of the main trie. This is what a real
+    /// product sends: revive keeps each contract's storage in its own child trie,
+    /// so a dotNS lookup is a main-trie read for the contract's trie_id followed
+    /// by a child read per 32-byte slot. Pass the bare trie_id; the
+    /// ":child_storage:default:" prefix is added for you.
+    ///
+    /// A trie_id (or a revive_get_storage address) that does not exist on the
+    /// target chain still gets a successful, much cheaper response — check the
+    /// proof sizes look sane before trusting a ceiling.
+    ///
     /// The `/light/2` half of a smoldot warp sync is also available as presets:
     /// warp_code (the runtime download — one request, ~1.65 MiB of response on
     /// Kusama), plus the consensus calls babe_configuration, babe_current_epoch,

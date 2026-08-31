@@ -224,6 +224,46 @@ pub fn remote_read(block_hash: Vec<u8>, keys: Vec<Vec<u8>>) -> Vec<u8> {
     request.encode_to_vec()
 }
 
+/// Prefix that turns a bare child trie name into the prefixed storage key the
+/// node expects in `RemoteReadChildRequest::storage_key`.
+///
+/// `sp_storage::well_known_keys::DEFAULT_CHILD_STORAGE_KEY_PREFIX`
+/// (`polkadot-sdk/substrate/primitives/storage/src/lib.rs:230`). The handler runs
+/// `ChildType::from_prefixed_key` on the field and rejects a bare name with
+/// `InvalidChildStorageKey`, so the prefix is mandatory on the wire.
+pub const DEFAULT_CHILD_STORAGE_KEY_PREFIX: &[u8] = b":child_storage:default:";
+
+/// Encode a `RemoteReadChildRequest` (child-trie storage Merkle proof) for
+/// `/light/2`.
+///
+/// `child_trie` is the **bare** trie name — for a revive contract, the
+/// `trie_id` out of its `ContractInfo`. The `:child_storage:default:` prefix is
+/// prepended here, matching what smoldot does in
+/// `lib/src/network/codec/storage_call_proof.rs`.
+///
+/// This is a *read*, not a runtime call: the node answers from
+/// `Client::read_child_proof` with no Wasm execution
+/// (`substrate/client/network/light/src/light_client_requests/handler.rs:252`).
+/// The reply is an ordinary `RemoteReadResponse`, so [`decode_response`] needs no
+/// special case for it.
+pub fn remote_read_child(block_hash: Vec<u8>, child_trie: &[u8], keys: Vec<Vec<u8>>) -> Vec<u8> {
+    let mut storage_key =
+        Vec::with_capacity(DEFAULT_CHILD_STORAGE_KEY_PREFIX.len() + child_trie.len());
+    storage_key.extend_from_slice(DEFAULT_CHILD_STORAGE_KEY_PREFIX);
+    storage_key.extend_from_slice(child_trie);
+
+    let request = schema::Request {
+        request: Some(schema::request::Request::RemoteReadChildRequest(
+            schema::RemoteReadChildRequest {
+                block: block_hash,
+                storage_key,
+                keys,
+            },
+        )),
+    };
+    request.encode_to_vec()
+}
+
 /// A decoded `/light/2` response, summarised for logging/stats.
 #[derive(Debug, Clone)]
 pub enum LightResponse {
@@ -259,4 +299,93 @@ pub fn decode_response(bytes: &[u8]) -> Result<LightResponse, prost::DecodeError
         },
         None => LightResponse::Empty,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three request builders must land in the right `oneof` slot: the node
+    /// dispatches on it (`light_client_requests/handler.rs`), and a child read
+    /// arriving as `RemoteReadRequest` would be answered off the main trie —
+    /// a successful response to the wrong question.
+    #[test]
+    fn each_builder_encodes_its_own_request_variant() {
+        let block = vec![9u8; 32];
+
+        let call = schema::Request::decode(
+            &remote_call(block.clone(), "Core_version".to_string(), Vec::new())[..],
+        )
+        .expect("valid protobuf");
+        assert!(matches!(
+            call.request,
+            Some(schema::request::Request::RemoteCallRequest(_))
+        ));
+
+        let read =
+            schema::Request::decode(&remote_read(block.clone(), vec![b":code".to_vec()])[..])
+                .expect("valid protobuf");
+        assert!(matches!(
+            read.request,
+            Some(schema::request::Request::RemoteReadRequest(_))
+        ));
+
+        let child = schema::Request::decode(
+            &remote_read_child(block.clone(), &[1, 2, 3], vec![b"slot".to_vec()])[..],
+        )
+        .expect("valid protobuf");
+        assert!(matches!(
+            child.request,
+            Some(schema::request::Request::RemoteReadChildRequest(_))
+        ));
+    }
+
+    /// `storage_key` must carry the `:child_storage:default:` prefix. The handler
+    /// runs `ChildType::from_prefixed_key` on it and fails the request with
+    /// `InvalidChildStorageKey` for a bare trie name, so an unprefixed key would
+    /// measure the error path.
+    #[test]
+    fn child_reads_prefix_the_bare_trie_id() {
+        let block = vec![9u8; 32];
+        let trie_id = [0xaa, 0xbb, 0xcc];
+
+        let bytes = remote_read_child(
+            block.clone(),
+            &trie_id,
+            vec![b"one".to_vec(), b"two".to_vec()],
+        );
+        let request = schema::Request::decode(&bytes[..]).expect("valid protobuf");
+
+        let Some(schema::request::Request::RemoteReadChildRequest(r)) = request.request else {
+            panic!("expected a child read request");
+        };
+        assert_eq!(r.block, block);
+        assert_eq!(
+            r.storage_key,
+            [b":child_storage:default:".as_slice(), &trie_id].concat(),
+            "the prefix is prepended exactly once, ahead of the bare trie id"
+        );
+        assert_eq!(
+            r.keys,
+            vec![b"one".to_vec(), b"two".to_vec()],
+            "every key rides in one request"
+        );
+    }
+
+    /// A child read is answered with a plain `RemoteReadResponse` — there is no
+    /// child-specific response variant — so the stats path must classify it as a
+    /// read rather than falling through to `Empty`.
+    #[test]
+    fn child_read_responses_decode_as_reads() {
+        let response = schema::Response {
+            response: Some(schema::response::Response::RemoteReadResponse(
+                schema::RemoteReadResponse {
+                    proof: Some(vec![0u8; 128]),
+                },
+            )),
+        };
+        let decoded = decode_response(&response.encode_to_vec()).expect("valid protobuf");
+        assert!(matches!(decoded, LightResponse::Read { .. }));
+        assert_eq!(decoded.proof_len(), Some(128));
+    }
 }

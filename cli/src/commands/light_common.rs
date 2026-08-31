@@ -158,8 +158,59 @@ pub(crate) struct DotnsEntry {
     pub data: Vec<u8>,
 }
 
+/// One key in a read request: a fixed prefix, optionally followed by
+/// `random_bytes` fresh random bytes materialised per request.
+///
+/// The randomised form exists to defeat cache warming. A fixed key pulls its
+/// trie path into the node's node cache on the first request, so every request
+/// after it is a cache hit walking the same path — for a small read, where the
+/// walk *is* the cost, that measures re-answering one cached lookup rather than
+/// serving reads. Real clients scatter their keys across the trie. This is the
+/// same reasoning behind the random key in [`MethodKind::ReviveGetStorage`].
+///
+/// Note that a random key almost certainly does not exist, so the response is an
+/// absence proof: a real trie walk with real cache misses, but fewer bytes than a
+/// hit. For honest response sizes use fixed keys that resolve (e.g.
+/// `revive_dotns`) and report the two separately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadKey {
+    /// Literal leading bytes, e.g. a `twox128(pallet) ++ twox128(item)` prefix.
+    pub prefix: Vec<u8>,
+    /// Fresh random bytes appended per request. 0 = a fully fixed key.
+    pub random_bytes: usize,
+}
+
+impl ReadKey {
+    /// A key with no randomised tail.
+    pub(crate) fn fixed(prefix: Vec<u8>) -> Self {
+        Self {
+            prefix,
+            random_bytes: 0,
+        }
+    }
+
+    /// Build the concrete key for one request.
+    pub(crate) fn materialize(&self) -> Vec<u8> {
+        if self.random_bytes == 0 {
+            return self.prefix.clone();
+        }
+        let mut key = Vec::with_capacity(self.prefix.len() + self.random_bytes);
+        key.extend_from_slice(&self.prefix);
+        let mut tail = vec![0u8; self.random_bytes];
+        rand::thread_rng().fill_bytes(&mut tail);
+        key.extend_from_slice(&tail);
+        key
+    }
+}
+
+/// Materialize a whole key list for one request.
+fn materialize_keys(keys: &[ReadKey]) -> Vec<Vec<u8>> {
+    keys.iter().map(ReadKey::materialize).collect()
+}
+
 /// How a single request is built. Most are runtime-API calls (`RemoteCallRequest`);
-/// `read` is a storage Merkle proof (`RemoteReadRequest`).
+/// `read` is a main-trie storage Merkle proof (`RemoteReadRequest`) and
+/// `read_child` the child-trie equivalent (`RemoteReadChildRequest`).
 #[derive(Debug, Clone)]
 pub(crate) enum MethodKind {
     /// `AccountNonceApi_account_nonce(AccountId32)` — random account.
@@ -179,8 +230,21 @@ pub(crate) enum MethodKind {
     ReviveDotns { entries: Vec<DotnsEntry> },
     /// Arbitrary `RemoteCallRequest` with a fixed method + hex-encoded data.
     GenericCall { method: String, data: Vec<u8> },
-    /// Arbitrary `RemoteReadRequest` for one or more hex-encoded storage keys.
-    GenericRead { keys: Vec<Vec<u8>> },
+    /// Arbitrary `RemoteReadRequest` for one or more storage keys.
+    GenericRead { keys: Vec<ReadKey> },
+    /// Arbitrary `RemoteReadChildRequest`: the same keys read from the child trie
+    /// named `child_trie` (bare name — the `:child_storage:default:` prefix is
+    /// added by the encoder).
+    ///
+    /// This is the shape a real product sends. A dotli dotNS lookup reads a
+    /// revive contract's slots, and revive keeps every contract's storage in its
+    /// own child trie (`frame/revive/src/storage.rs`, `ChildInfo::new_default`),
+    /// so the client does a main-trie read for the contract's `trie_id` and then
+    /// a child read per 32-byte slot.
+    GenericReadChild {
+        child_trie: Vec<u8>,
+        keys: Vec<ReadKey>,
+    },
 }
 
 pub(crate) fn random_account() -> Vec<u8> {
@@ -248,9 +312,59 @@ impl MethodKind {
             MethodKind::GenericCall { method, data } => {
                 light::remote_call(block, method.clone(), data.clone())
             }
-            MethodKind::GenericRead { keys } => light::remote_read(block, keys.clone()),
+            MethodKind::GenericRead { keys } => light::remote_read(block, materialize_keys(keys)),
+            MethodKind::GenericReadChild { child_trie, keys } => {
+                light::remote_read_child(block, child_trie, materialize_keys(keys))
+            }
         }
     }
+}
+
+/// Parse a `+`-separated key list into [`ReadKey`]s.
+///
+/// Each key is `<hex>` for a fixed key, or `<hex>:rand[N]` for that hex prefix
+/// followed by `N` fresh random bytes per request (`N` defaults to 32, the width
+/// of both an `AccountId32` and an EVM storage slot). `<hex>` may be empty in the
+/// randomised form, which gives a wholly random key.
+///
+/// Keys are separated with `+`, not `,`: `parse_method_spec` splits the spec on
+/// `,` before this ever runs, so a comma would detach every key after the first.
+fn parse_read_keys(spec: &str, what: &str) -> Result<Vec<ReadKey>, Box<dyn Error>> {
+    let mut keys = Vec::new();
+    for token in spec.split('+').map(str::trim).filter(|s| !s.is_empty()) {
+        let (hex_part, random_bytes) = match token.split_once(':') {
+            Some((hex_part, tail)) => {
+                let tail = tail.trim();
+                let digits = tail
+                    .strip_prefix("rand")
+                    .ok_or_else(|| format!("unknown key suffix ':{tail}' — expected ':rand[N]'"))?;
+                let n = if digits.is_empty() {
+                    32
+                } else {
+                    digits.parse::<usize>().map_err(|_| {
+                        format!("':rand{digits}' needs a byte count, e.g. ':rand32'")
+                    })?
+                };
+                if n == 0 {
+                    return Err("':rand0' adds no bytes — drop the suffix for a fixed key".into());
+                }
+                (hex_part.trim(), n)
+            }
+            None => (token, 0),
+        };
+        let prefix = hex::decode(hex_part.trim_start_matches("0x"))?;
+        if prefix.is_empty() && random_bytes == 0 {
+            return Err(format!("{what}: empty storage key").into());
+        }
+        keys.push(ReadKey {
+            prefix,
+            random_bytes,
+        });
+    }
+    if keys.is_empty() {
+        return Err(format!("{what} needs at least one hex storage key").into());
+    }
+    Ok(keys)
 }
 
 /// Parse a single method token into a labelled [`MethodKind`].
@@ -285,7 +399,10 @@ pub(crate) fn parse_method(token: &str) -> Result<(String, MethodKind), Box<dyn 
         // Both keys go in one request, as smoldot sends them (`warp_sync.rs`,
         // `keys: vec![code_key_to_request, b":heappages"]`).
         "warp_code" => MethodKind::GenericRead {
-            keys: vec![b":code".to_vec(), b":heappages".to_vec()],
+            keys: vec![
+                ReadKey::fixed(b":code".to_vec()),
+                ReadKey::fixed(b":heappages".to_vec()),
+            ],
         },
 
         // Step 4, the consensus parameters. Small on the wire — the proof holds
@@ -370,17 +487,38 @@ pub(crate) fn parse_method(token: &str) -> Result<(String, MethodKind), Box<dyn 
         // the bare-runtime-API arm and silently become runtime calls named after
         // the hex string.
         _ if token.starts_with("read:") => {
-            let rest = &token["read:".len()..];
-            let keys = rest
-                .split('+')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|k| hex::decode(k.trim_start_matches("0x")))
-                .collect::<Result<Vec<_>, _>>()?;
-            if keys.is_empty() {
-                return Err("read: needs at least one hex storage key".into());
-            }
+            let keys = parse_read_keys(&token["read:".len()..], "read:")?;
             MethodKind::GenericRead { keys }
+        }
+        // read_child:<hex trie_id>:<hexkey>[+<hexkey>…] — the same keys read from
+        // one contract's child trie, in a single `RemoteReadChildRequest`.
+        //
+        // `trie_id` is the bare child trie name; the encoder adds the
+        // `:child_storage:default:` prefix. Getting it is the client's first hop:
+        // read `Revive::AccountInfoOf[address]` off the main trie and decode
+        // `ContractInfo.trie_id` (the SCALE `Vec<u8>` right after the 0x00
+        // Contract enum tag), e.g.
+        //
+        //   KEY=0x$(printf %s "$(twox128 Revive)$(twox128 AccountInfoOf)")<address>
+        //   curl … -d '{"method":"state_getStorage","params":["'$KEY'"]}'
+        //
+        // A `trie_id` that does not exist on the target chain is the same trap as
+        // a wrong `revive_get_storage` address: the node still answers, just off a
+        // much cheaper path (nothing to walk), so the run looks healthy while
+        // measuring the wrong thing. Sanity-check the response sizes against a
+        // known-good slot before trusting a number.
+        _ if token.starts_with("read_child:") => {
+            let rest = &token["read_child:".len()..];
+            let (trie_id_hex, keys_spec) = rest.split_once(':').ok_or(
+                "read_child needs a child trie and keys: \
+                 read_child:<hex trie_id>:<hexkey>[+<hexkey>…]",
+            )?;
+            let child_trie = hex::decode(trie_id_hex.trim().trim_start_matches("0x"))?;
+            if child_trie.is_empty() {
+                return Err("read_child: empty child trie id".into());
+            }
+            let keys = parse_read_keys(keys_spec, "read_child:")?;
+            MethodKind::GenericReadChild { child_trie, keys }
         }
         other => return Err(format!("unknown method '{other}'").into()),
     };
@@ -729,8 +867,14 @@ mod tests {
         let (_, kind) = parse_method("warp_code").expect("warp_code parses");
         match kind {
             MethodKind::GenericRead { keys } => {
-                // Both keys in one request, in smoldot's order.
-                assert_eq!(keys, vec![b":code".to_vec(), b":heappages".to_vec()]);
+                // Both keys in one request, in smoldot's order, neither randomised.
+                assert_eq!(
+                    keys,
+                    vec![
+                        ReadKey::fixed(b":code".to_vec()),
+                        ReadKey::fixed(b":heappages".to_vec()),
+                    ]
+                );
             }
             other => panic!("warp_code should be a storage read, got {other:?}"),
         }
@@ -767,10 +911,118 @@ mod tests {
         match &methods[0].1 {
             // `0x` prefixes are optional and stripped per key.
             MethodKind::GenericRead { keys } => {
-                assert_eq!(keys, &vec![vec![0xaa, 0xbb], vec![0xcc, 0xdd]]);
+                assert_eq!(
+                    keys,
+                    &vec![
+                        ReadKey::fixed(vec![0xaa, 0xbb]),
+                        ReadKey::fixed(vec![0xcc, 0xdd])
+                    ]
+                );
             }
             other => panic!("expected a storage read, got {other:?}"),
         }
+    }
+
+    /// `:rand[N]` is what keeps a small read from measuring the node's node cache.
+    /// The prefix is fixed, the tail is fresh per request, and the width defaults
+    /// to 32 bytes (an `AccountId32` / an EVM slot).
+    #[test]
+    fn random_key_suffix_widens_the_prefix_and_varies_per_request() {
+        let account_prefix = "26aa394eea5630e07c48ae0c9558cef7b99d880ec681799c0cf30e8886371da9";
+        let (_, kind) =
+            parse_method(&format!("read:{account_prefix}:rand")).expect("a randomised read parses");
+
+        let keys = match &kind {
+            MethodKind::GenericRead { keys } => keys,
+            other => panic!("expected a storage read, got {other:?}"),
+        };
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].prefix, hex::decode(account_prefix).unwrap());
+        assert_eq!(keys[0].random_bytes, 32, ":rand defaults to 32 bytes");
+
+        // The fixed prefix is preserved and the tail actually moves.
+        let first = keys[0].materialize();
+        let second = keys[0].materialize();
+        assert_eq!(first.len(), 32 + 32);
+        assert_eq!(first[..32], second[..32], "the prefix is fixed");
+        assert_ne!(first, second, "the tail is fresh per request");
+
+        // An explicit width, and a fully random key (empty prefix).
+        let (_, kind) = parse_method("read:aabb:rand8").expect("an explicit width parses");
+        match kind {
+            MethodKind::GenericRead { keys } => {
+                assert_eq!(keys[0].random_bytes, 8);
+                assert_eq!(keys[0].materialize().len(), 2 + 8);
+            }
+            other => panic!("expected a storage read, got {other:?}"),
+        }
+        let (_, kind) = parse_method("read::rand16").expect("an empty prefix parses");
+        match kind {
+            MethodKind::GenericRead { keys } => {
+                assert!(keys[0].prefix.is_empty());
+                assert_eq!(keys[0].materialize().len(), 16);
+            }
+            other => panic!("expected a storage read, got {other:?}"),
+        }
+
+        // A fixed key stays byte-for-byte stable, and a typo'd suffix is an error
+        // rather than a silently fixed key.
+        let (_, kind) = parse_method("read:aabb").expect("a fixed key parses");
+        match kind {
+            MethodKind::GenericRead { keys } => {
+                assert_eq!(keys[0].random_bytes, 0);
+                assert_eq!(keys[0].materialize(), keys[0].materialize());
+            }
+            other => panic!("expected a storage read, got {other:?}"),
+        }
+        assert!(parse_method("read:aabb:random32").is_err());
+        assert!(parse_method("read:aabb:rand0").is_err());
+    }
+
+    /// `read_child` must produce a `RemoteReadChildRequest`, and the encoder must
+    /// prefix the bare trie id — the node runs `ChildType::from_prefixed_key` on
+    /// the field and rejects a bare name with `InvalidChildStorageKey`.
+    #[test]
+    fn child_reads_carry_the_trie_id_and_encode_as_a_child_request() {
+        let trie_id = "0102030405060708";
+        let slot = "deadbeef";
+        let (label, kind) = parse_method(&format!("read_child:{trie_id}:{slot}+aabb:rand32"))
+            .expect("a child read parses");
+        assert_eq!(label, format!("read_child:{trie_id}:{slot}+aabb:rand32"));
+
+        match &kind {
+            MethodKind::GenericReadChild { child_trie, keys } => {
+                assert_eq!(child_trie, &hex::decode(trie_id).unwrap());
+                assert_eq!(keys.len(), 2, "both keys ride in one request");
+                assert_eq!(keys[0], ReadKey::fixed(hex::decode(slot).unwrap()));
+                assert_eq!(keys[1].random_bytes, 32);
+            }
+            other => panic!("expected a child storage read, got {other:?}"),
+        }
+
+        // The two variants must not encode to the same bytes — that they are the
+        // right protobuf messages is asserted in `subp2p_explorer::light`.
+        let head = [7u8; 32];
+        let (_, main) = parse_method(&format!("read:{slot}")).expect("a main read parses");
+        assert_ne!(
+            kind.build(&head, 0),
+            main.build(&head, 0),
+            "a child read must not encode as a main-trie read"
+        );
+    }
+
+    /// The missing-argument shapes must fail loudly, not fall through to the
+    /// bare-runtime-API arm and become a call named after the hex.
+    #[test]
+    fn malformed_child_reads_are_rejected() {
+        // No keys at all.
+        assert!(parse_method("read_child:0102").is_err());
+        // Keys but no trie id.
+        assert!(parse_method("read_child:aabb").is_err());
+        // Empty trie id.
+        assert!(parse_method("read_child::aabb").is_err());
+        // Odd-length hex.
+        assert!(parse_method("read_child:010:aabb").is_err());
     }
 
     /// The old silent failure: a key separated with `,` got detached and became a
