@@ -1,143 +1,116 @@
-# Single-node light-request capacity test
+# Single-node light-request capacity
 
-How to measure how many `/<genesis>/light/2` requests a single full node can serve,
-and the data we have so far.
+How many `/<genesis>/light/2` requests can one full node serve?
 
-> **Tooling location.** The load-test CLI used here lives in the
-> `subp2p-explorer` repo, branch **`lrubasze/node-load-test`**:
-> <https://github.com/michalkucharczyk/subp2p-explorer/tree/lrubasze/node-load-test>
-> (commands `spam-light` / `soak-light`, crate `subp2p-explorer-cli`). The
-> `run-spam-light` / `run-soak-light` scripts referenced below are thin wrappers
-> around those commands.
+**The numbers live in [`SCALING.md`](SCALING.md).** This file is the method and the
+upstream context. It was originally a plan; the campaign has since run, and the
+sections below are corrected against what it measured — see *What this document used
+to claim* at the end, because the original model was wrong in a way worth recording.
+
+> **Tooling.** Branch `lrubasze/node-load-test` of `subp2p-explorer` (commands
+> `spam-light` / `soak-light`, crate `subp2p-explorer-cli`). The harness is
+> `run-light-sweep` (ceilings), `run-two-proc` (is a ceiling ours or the node's?),
+> `mix-rate` (derive a mixed-soak rate), `run-light-soak` (long runs),
+> `run-monitor-health` + `run-monitor-node` (node health).
 
 ## Motivation
 
-Few data exists on how many light-client requests one node can serve. The
-server-side handler processes requests on a **single serial worker** behind a
-**global bounded queue** (`MAX_LIGHT_REQUEST_QUEUE = 20`,
-`substrate/client/network/light/src/light_client_requests/handler.rs`). The
-comment on that constant states the value was copied from the block-request
-limit "due to lack of data on light client request handling in production
-systems." This test produces that missing data.
+Few data existed on how many light-client requests one node can serve. The comment
+on `MAX_LIGHT_REQUEST_QUEUE` in
+`substrate/client/network/light/src/light_client_requests/handler.rs` says the value
+was copied from the block-request limit "due to lack of data on light client request
+handling in production systems." This campaign produced that data.
 
-Key facts about the server path (polkadot-sdk):
+## The headline
+
+**"Light requests per second" is not a number.** Across the agreed request set,
+response sizes span 1 B to 1.73 MB and ceilings span 128/s to 25,254/s — 197×. Any
+answer has to name the request. And the axis that predicts cost is
+**call-vs-read**, not response size: a read and a call over the same trie path with
+proofs of 2,424 vs 2,425 B differ by **4.4×** in throughput.
+
+Above that sits a second result: for everything byte-heavy, a spec node's
+**500 Mbit/s uplink runs out before the node does**, by up to 26×.
+
+## Server-side facts (polkadot-sdk @ `0e1812505`, litep2p)
 
 - One shared queue of **20** pending requests for the whole protocol, across all
-  connections and peers (not per-peer).
-- A **single** task drains it, running `client.execution_proof(...)` one request
-  at a time (`handler.rs` run loop).
-- When the queue is full the incoming request is **silently dropped**
-  (`try_send` fails → `InboundFailure::Omission`); no back-pressure, the remote
-  just times out.
+  connections and peers — not per-peer. Settable via
+  `--light-client-request-queue-size`; 20 is the upstream default.
+- It is a **burst** limit, not a capacity limit. Arrivals far above 20 in flight
+  shed heavily at *unchanged* mean load — MEASURED: the same offered rate shed 20.3%
+  at 128 concurrent and 0% at 16.
+- When the queue is full the request is dropped, and on **litep2p** that is visible
+  from both ends: the client sees the substream closed with no proof, and the node
+  counts `requests_in_failure_total{reason="sending into a full channel"}`.
+  Backend-specific — libp2p says `busy-omitted` and does not record handler refusals.
+- `RemoteReadChildRequest` is the third message type (oneof field 4, alongside
+  call=1 and read=2) and is a **read**: answered from `read_child_proof` with no
+  Wasm. `storage_key` must carry the `:child_storage:default:` prefix.
+- **Capacity is not `1 / service_time` of a single serial worker.** See below.
 
-So node capacity is essentially `1 / service_time` of that single worker, and
-`service_time` depends heavily on the runtime method being called.
+## Method
 
-## What we already measured
+Four things, in order. Each exists because a shortcut past it produced a wrong
+number at some point in this campaign.
 
-Two `run-spam-light` runs, identical load — 1 connection, `--concurrency 10`,
-1000 requests, the same 7-method mix — RPC via `wss://kusama-rpc.polkadot.io`,
-executing against a recent finalized Kusama block:
+**1. Sweep concurrency, not rate.** Set `--rate` far above anything achievable and
+`soak-light` becomes closed-loop at concurrency = `--clients`. Sweep from 1 upward
+and take the **peak** of the curve. Both directions are traps: too few connections
+measures your own client (achievable rate is `clients ÷ latency`, so `shed=0` below
+target means you measured yourself), and too many produces congestion collapse
+(`Core_version`: 7,699/s at 16 clients, 6,476/s at 32). The knee ranges from 2 to 48
+across the set, so no client count transfers between operations.
 
-| | Kusama node under test (v1.24.0) | Parity `kusama-bootnode-0` (v1.19.0) |
-|---|---|---|
-| Throughput | **686 ok req/s** | 144 ok req/s |
-| Latency p50 / p99 | 11.8 / 31.4 ms | 61.7 / 95.9 ms |
-| err / timeout | 0 / 0 | 0 / 0 |
-| Total proof bytes | 18,135,419 | 18,127,045 |
+**2. Read serve time at one client only.** Past the knee `send->resp` is queueing,
+not service: `Metadata_metadata` reads 15.6 ms at 2 clients and 92.8 ms at 12 for
+the *same* 128/s, each extra client adding exactly `1/128 s`.
 
-Conclusions (with the supporting arithmetic):
+**3. Confirm saturation by shedding, never by extrapolation.** A peak sitting on the
+last rung of the ladder with no shedding anywhere is an unfinished ladder, not a
+ceiling. That mistake is what made `:code` reads look like ~690/s when they are
+~930/s.
 
-1. **Neither run saturated the node.** Offered in-flight was 10, below the
-   20-slot queue, and `err`/`timeout` stayed 0. **686 req/s is a lower bound,
-   not the ceiling.**
-2. **The two nodes differ by network distance, not capacity.** Proof work was
-   identical (~18.13 MB both). The latency gap (~50 ms) is constant across all 7
-   methods regardless of proof size. Little's law confirms both runs were
-   *window-bound*: `10 / 14.6 ms ≈ 686`, `10 / 69 ms ≈ 144`. The bootnode's
-   144 req/s is a round-trip-time artifact and must not be read as its capacity.
-3. **Derived service-time bound.** A serial worker sustaining 686 completions/s
-   spends **≤ 1.46 ms per request** (1/686) on this mix, so the true ceiling is
-   `1/service_time ≥ 686 req/s` — and probably well above it, since the worker
-   was never the bottleneck.
+**4. Cross-check every client figure against the node's own counter.**
+`requests_in_success_total_count` matched the client to within `clients` requests on
+every point of every sweep — the difference being the in-flight requests aborted at
+the deadline. Note the trap: the sibling **`_sum` is not serve time on litep2p**,
+which stamps it after the response future resolves and so under-reports by ~8100×.
 
-### Proof size per method (network-independent — the solid finding)
-
-| Method | Avg proof size |
-|---|---|
-| `ParachainHost_candidate_events` | ~40 KB (heaviest) |
-| `BabeApi_current_epoch` | ~29 KB |
-| `GrandpaApi_grandpa_authorities` | ~29 KB |
-| `ParachainHost_validators` | ~23 KB |
-| `account_nonce` | ~2.4 KB |
-| `ParachainHost_disputes` | ~1.5 KB |
-| `Metadata_metadata` | ~0.9 KB (lightest) |
-
-Note `Metadata_metadata` is tiny in *proof* terms despite the large metadata
-blob, because metadata is built from the runtime, not read from state.
-
-## Getting the missing data (the ceiling)
-
-We never overflowed the queue, so the ceiling is still unknown. Procedure:
-
-1. **Run the client close to the node.** Same DC, or `--url ws://127.0.0.1:9944`
-   on the node host. Otherwise results are RTT-bound and you re-measure the
-   network (see the bootnode run above).
-
-2. **Overflow the 20-slot queue.** Two options:
-   - `run-spam-light` (closed-loop): push the window past 20 —
-     `--concurrency 32 --connections 4` (128 in-flight), `--count 20000`.
-   - `run-soak-light` (open-loop, cleaner): sweep `--rate` **above the 686
-     floor** — 1000 → 2000 → 3000 → 5000 req/s. Service time ≤ 1.46 ms puts the
-     ceiling in the low thousands.
-
-3. **Find the knee.** The offered rate where **`err`/`timeout` climb off zero**
-   (queue overflow → `InboundFailure::Omission`) and **completed req/s
-   plateaus** is the ceiling ≈ `1/service_time`.
-
-4. **Measure cheap vs heavy separately.** Run `account_nonce` alone (best case)
-   and `ParachainHost_candidate_events` alone (~40 KB proof — expect a *lower*
-   ceiling, the pessimistic number under a heavy-method attack). Report a number
-   per method, not one blended figure.
-
-5. **Capture node-side CPU** during the sweep. Proof generation is
-   single-core-bound; the node pinning one core at the plateau confirms you
-   found the real bottleneck.
+For a mixed run, add: derive the offered rate from the measured ceilings
+(`mix-rate`) so operations share the node by cost rather than each running at its own
+solo fraction, and check the per-method `issued` counts against the weights before
+trusting the run.
 
 ## Deliverable
 
-Per method: a curve of **offered rate → completed rate + drop rate**, the
-plateau (max sustained req/s), and CPU at saturation. This turns "few data
-exists" into concrete figures such as "node X serves ~N `account_nonce`/s and
-~M `candidate_events`/s before dropping," and informs whether the 20-slot
-queue and single-worker design should be revisited (e.g. a bounded proof-worker
-pool, and/or per-peer fairness so one client cannot monopolise all 20 slots).
+Per operation: proof size, serve time, knee, ceiling, effective parallelism, byte
+rate, and the share of a 500 Mbit/s uplink it consumes. Plus a long mixed run for
+sustained behaviour. All in `SCALING.md`.
 
-## Reference commands
+## What this document used to claim
 
-Baseline (per-method latency + proof size, low load):
+The original version stated that the handler "processes requests on a **single
+serial worker**", and concluded that "node capacity is essentially
+`1 / service_time` of that single worker". **The measurements do not fit that
+model**, and anyone reasoning from it will be wrong by a large factor:
 
-```bash
-cargo run -p subp2p-explorer-cli --release -- spam-light \
-  --url ws://127.0.0.1:9944 \
-  --address /ip4/<NODE_IP>/tcp/30333 \
-  --method account_nonce --count 200 --concurrency 1 --connections 1
-```
+- MEASURED: the polkadot process burns **5.89 cores** while serving small reads at
+  25,254/s (sampler reads `/proc/<polkadot pid>/stat`, so this excludes the
+  generator; the node idles at ~0.47 cores). A single serial worker cannot exceed
+  one core.
+- CALCULATED: `ceiling × single-client serve time` — requests in flight at
+  saturation — ranges from **2.2** (`Metadata_metadata`) to **7.6** (small read).
+  A strictly serial worker would put it at ~1, and the *variation* across operations
+  is the part a serial model cannot produce at all.
 
-Saturation sweep (open-loop, step `--rate` until drops appear):
+So the 20-slot queue is a burst limit in front of something that serves several
+requests at once, and cheap requests interleave better than expensive ones. What is
+*not* pinned down is the mechanism — worker count is not separable from per-worker
+service time by these measurements alone.
 
-```bash
-cargo run -p subp2p-explorer-cli --release -- soak-light \
-  --url ws://127.0.0.1:9944 \
-  --address /ip4/<NODE_IP>/tcp/30333 \
-  --method ParachainHost_candidate_events \
-  --rate 1000 --duration 60 --clients 200
-```
-
-Notes:
-- `--url` needs a reachable RPC of the **same chain** (only genesis + finalized
-  head are read from it); the actual load goes to `--address`.
-- The peer id in `--address` (`/p2p/12D3…`) is optional — it is learned during
-  the noise handshake, and if present is verified.
-- Method tokens are chain-specific. The ones above are for the **Kusama relay**;
-  see `spam-light --help` for the full syntax (`call:`/`read:`/weights).
+The original per-method proof sizes and the "686 req/s" figure are also superseded.
+That run offered 10 in flight against a 20-slot queue with `err`/`timeout` at zero,
+which by trap 1 above means it measured the client: `10 / 14.6 ms ≈ 686`. It was
+correctly labelled a lower bound at the time; the actual figure for that mix is
+several thousand per second.
