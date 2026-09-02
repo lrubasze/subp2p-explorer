@@ -525,20 +525,48 @@ pub(crate) fn parse_method(token: &str) -> Result<(String, MethodKind), Box<dyn 
     Ok((token.to_string(), kind))
 }
 
-/// Parse a comma-separated, optionally `:weight`-suffixed method spec into a set
-/// of labelled methods plus a weight-expanded round-robin schedule (indices into
-/// the methods vector). Port of `call-load.js::parseMethodSpec`.
+/// Parse a comma-separated, weighted method spec into a set of labelled methods
+/// plus a weight-expanded round-robin schedule (indices into the methods vector).
+///
+/// Two weight syntaxes:
+///
+/// - `@<n>` works on **every** method form, including the generic `read:` /
+///   `call:` / `read_child:` ones. `read:<key>:rand48@400`.
+/// - `:<n>` works only on the plain named presets (`warp_code:3`), because the
+///   generic forms carry their own colons and peeling a trailing `:<n>` off those
+///   would hand `parse_method` a truncated token — a `:rand48` read would lose its
+///   suffix, and a key ending in digits would lose its tail.
+///
+/// `@` is the one separator that cannot collide: it appears in no hex key, no
+/// runtime API name, and no `:rand[N]` suffix. Quote the spec in the shell, since
+/// an unquoted `@` is fine but a `*` would have globbed.
 pub(crate) fn parse_method_spec(
     spec: &str,
 ) -> Result<(Vec<(String, MethodKind)>, Vec<usize>), Box<dyn Error>> {
     let mut methods: Vec<(String, MethodKind)> = Vec::new();
     let mut schedule: Vec<usize> = Vec::new();
+    let mut weights: Vec<(usize, usize)> = Vec::new();
 
     for tok in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        // A weight suffix only applies to the named methods (no embedded ':').
-        // Generic `call:`/`read:`/`revive_dotns:` tokens carry their own colons,
-        // so we only peel a trailing ":<n>" when the whole token isn't a generic form.
-        let (name, weight) = if tok.starts_with("call:")
+        // An explicit `@<n>` wins, and is the only form that can weight a
+        // generic method. A trailing `@` with a non-numeric tail is an error
+        // rather than a silently unweighted method: it is always a typo.
+        let at_weight = match tok.rsplit_once('@') {
+            Some((head, w)) => {
+                let parsed: usize = w.trim().parse().map_err(|_| {
+                    format!("'{tok}': '@{w}' is not a weight — expected '@<n>', e.g. '@400'")
+                })?;
+                if parsed == 0 {
+                    return Err(format!("'{tok}': weight 0 would never be issued").into());
+                }
+                Some((head.trim(), parsed))
+            }
+            None => None,
+        };
+
+        let (name, weight) = if let Some((head, w)) = at_weight {
+            (head, w)
+        } else if tok.starts_with("call:")
             || tok.starts_with("read:")
             || tok.starts_with("read_child:")
             || tok.starts_with("revive_dotns:")
@@ -556,14 +584,40 @@ pub(crate) fn parse_method_spec(
         let (label, kind) = parse_method(name)?;
         let idx = methods.len();
         methods.push((label, kind));
-        for _ in 0..weight {
-            schedule.push(idx);
-        }
+        weights.push((idx, weight));
     }
 
     if methods.is_empty() {
         return Err("empty method spec".into());
     }
+
+    // Interleave the schedule instead of emitting each method's slots as one
+    // consecutive block.
+    //
+    // A blocky schedule is not a mix, it is a sequence of monocultures: weights
+    // 800/100/80 would send 800 small reads, then 100 nonces, then 80 mid reads.
+    // Worse, a connection walks the schedule from 0 and only issues
+    // `rate*duration/clients` requests before it retires, so with a short
+    // per-connection budget every connection dies inside the first block and the
+    // other methods are *never issued at all*. MEASURED: a 90 s run of a
+    // seven-method mix issued 598,016 small reads and zero of everything else.
+    //
+    // Placing each method's k-th slot at (k + 0.5)/w along the unit interval and
+    // sorting gives an even spread: for every method and every prefix of the
+    // schedule, the count is within 1 of the ideal share. So any window of the
+    // schedule — including a short-lived connection's — approximates the weights.
+    let total: usize = weights.iter().map(|(_, w)| w).sum();
+    let mut slots: Vec<(f64, usize)> = Vec::with_capacity(total);
+    for &(idx, w) in &weights {
+        for k in 0..w {
+            slots.push(((k as f64 + 0.5) / w as f64, idx));
+        }
+    }
+    // Ties (two methods of equal weight) resolve by method order, which keeps the
+    // schedule deterministic across runs.
+    slots.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.cmp(&b.1)));
+    schedule.extend(slots.into_iter().map(|(_, idx)| idx));
+
     Ok((methods, schedule))
 }
 
@@ -1038,6 +1092,126 @@ mod tests {
             parse_method_spec("warp_code:3").expect("a weighted preset parses");
         assert_eq!(methods.len(), 1);
         assert_eq!(schedule.len(), 3);
+    }
+
+    /// `@<n>` is the only way to weight a generic `read:`/`call:` form, which is
+    /// what a realistic mixed soak needs: the reads carry most of the traffic, and
+    /// `:weight` cannot reach them.
+    #[test]
+    fn at_weights_apply_to_every_method_form() {
+        let account = "26aa394eea5630e07c48ae0c9558cef7b99d880ec681799c0cf30e8886371da9";
+        let spec = format!("read:{account}:rand48@400,account_nonce@200,Metadata_metadata@1");
+        let (methods, schedule) = parse_method_spec(&spec).expect("an @-weighted mix parses");
+
+        assert_eq!(
+            methods.len(),
+            3,
+            "one entry per method, not per schedule slot"
+        );
+        assert_eq!(schedule.len(), 601, "400 + 200 + 1");
+        assert_eq!(schedule.iter().filter(|&&i| i == 0).count(), 400);
+        assert_eq!(schedule.iter().filter(|&&i| i == 1).count(), 200);
+        assert_eq!(schedule.iter().filter(|&&i| i == 2).count(), 1);
+
+        // The weight is stripped before `parse_method`, so the read keeps both its
+        // key and its `:rand48` suffix — the whole point of not reusing `:`.
+        assert_eq!(methods[0].0, format!("read:{account}:rand48"));
+        match &methods[0].1 {
+            MethodKind::GenericRead { keys } => {
+                assert_eq!(keys.len(), 1);
+                assert_eq!(keys[0].random_bytes, 48, ":rand48 survived the weight peel");
+                assert_eq!(keys[0].prefix, hex::decode(account).unwrap());
+            }
+            other => panic!("expected a read, got {other:?}"),
+        }
+
+        // A weight of 1 is the default, and `@` composes with the older `:weight`.
+        let (_, schedule) = parse_method_spec("warp_code:3,Core_version@2").unwrap();
+        assert_eq!(schedule.len(), 5);
+    }
+
+    /// The schedule must be interleaved, not blocky. This is the bug that made a
+    /// 90-second seven-method soak issue 598,016 small reads and zero of anything
+    /// else: each connection walks the schedule from 0 and retires after
+    /// `rate*duration/clients` requests, so with a blocky schedule every
+    /// connection died inside the first method's block.
+    ///
+    /// The property that prevents it: for every method and every prefix of the
+    /// schedule, the running count is within 1 of that prefix's ideal share.
+    #[test]
+    fn the_schedule_spreads_each_method_across_the_whole_cycle() {
+        let account = "26aa394eea5630e07c48ae0c9558cef7b99d880ec681799c0cf30e8886371da9";
+        let spec = format!(
+            "read:{account}:rand48@800,account_nonce@100,read:cec5070d@80,\
+             babe_configuration@6,Core_version@4,warp_code@4,Metadata_metadata@2"
+        );
+        let (methods, schedule) = parse_method_spec(&spec).expect("the mix parses");
+        let weights = [800usize, 100, 80, 6, 4, 4, 2];
+        let total: usize = weights.iter().sum();
+        assert_eq!(methods.len(), 7);
+        assert_eq!(schedule.len(), total, "996 slots");
+
+        // Totals still honour the weights.
+        for (i, &w) in weights.iter().enumerate() {
+            assert_eq!(
+                schedule.iter().filter(|&&s| s == i).count(),
+                w,
+                "method {i} appears {w} times"
+            );
+        }
+
+        // Every prefix stays close to the ideal share — the spread property. The
+        // bound is a small constant rather than 1: each method's own slots are
+        // evenly spaced, but interleaving seven such sequences lets the dominant
+        // one drift by up to about half a slot per competing method. MEASURED max
+        // deviation for this mix is 1.55, so 2 is tight enough to still catch a
+        // blocky schedule, which deviates by hundreds.
+        let mut seen = [0usize; 7];
+        for (n, &idx) in schedule.iter().enumerate() {
+            seen[idx] += 1;
+            let len = n + 1;
+            for (i, &w) in weights.iter().enumerate() {
+                let ideal = len as f64 * w as f64 / total as f64;
+                assert!(
+                    (seen[i] as f64 - ideal).abs() <= 2.0,
+                    "prefix {len}: method {i} seen {} vs ideal {ideal:.2}",
+                    seen[i]
+                );
+            }
+        }
+
+        // Concretely: the case that failed. A connection with a 146-request budget
+        // must issue a representative mix, not 146 small reads.
+        let window = &schedule[..146];
+        let small_reads = window.iter().filter(|&&s| s == 0).count();
+        assert!(
+            (110..=125).contains(&small_reads),
+            "expected ~117 small reads in 146 slots, got {small_reads}"
+        );
+        assert!(
+            window.contains(&1),
+            "account_nonce must appear within the first 146 slots"
+        );
+        assert!(
+            window.contains(&2),
+            "the mid read must appear within the first 146 slots"
+        );
+    }
+
+    /// A malformed weight is a typo every time. Silently treating it as weight 1
+    /// would quietly change the shape of a 12-hour run.
+    #[test]
+    fn malformed_at_weights_are_rejected() {
+        assert!(parse_method_spec("account_nonce@").is_err(), "no digits");
+        assert!(
+            parse_method_spec("account_nonce@abc").is_err(),
+            "not a number"
+        );
+        assert!(
+            parse_method_spec("account_nonce@0").is_err(),
+            "never issued"
+        );
+        assert!(parse_method_spec("account_nonce@-1").is_err(), "negative");
     }
 
     /// The missing-argument shapes must fail loudly, not fall through to the

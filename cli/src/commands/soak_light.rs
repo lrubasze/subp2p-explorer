@@ -31,6 +31,7 @@ use libp2p::{
     swarm::SwarmEvent,
     Multiaddr, Swarm,
 };
+use rand::RngCore;
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -200,6 +201,18 @@ async fn run_connection(
     report.setup_us = Some(t_dial.elapsed().as_micros() as u64);
     log::info!("conn {id} connected to {peer}");
 
+    // Start each connection at a random point in the schedule.
+    //
+    // Without this every connection walks the schedule from slot 0, and a
+    // connection only issues `rate*duration/clients` requests before it retires —
+    // so any method whose first slot lies past that budget is never issued at
+    // all. MEASURED with a 98-request budget over a 996-slot schedule: the three
+    // lowest-weighted methods (first slots at 125, 125 and 249) sent zero
+    // requests, and the one at slot 83 was issued once per connection instead of
+    // its share. A random offset makes the mix come out right for any budget, and
+    // stops all connections marching through the schedule in lockstep.
+    let sched_offset = rand::thread_rng().next_u32() as usize % schedule.len();
+
     while report.issued < lifetime && TokioInstant::now() < deadline {
         // Pace against the global rate: wait for a permit (or stop at the deadline).
         tokio::select! {
@@ -212,7 +225,7 @@ async fn run_connection(
         if TokioInstant::now() >= deadline {
             break;
         }
-        let idx = schedule[report.issued % schedule.len()];
+        let idx = schedule[(sched_offset + report.issued) % schedule.len()];
         let (hash, num) = head.borrow().clone();
         let payload = methods[idx].1.build(&hash, num);
         let req_id = swarm.behaviour_mut().light.send_request(&peer, payload);

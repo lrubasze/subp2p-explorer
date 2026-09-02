@@ -32,6 +32,7 @@ use libp2p::{
     swarm::SwarmEvent,
     Multiaddr, PeerId, Swarm,
 };
+use rand::RngCore;
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -94,6 +95,11 @@ struct LightSpammer {
     errors: HashMap<String, u64>,
     pending: HashMap<OutboundRequestId, (usize, Instant)>,
     issued: usize,
+    /// Where this worker starts in the round-robin schedule. Random per worker:
+    /// every worker starting at slot 0 means a method whose first slot lies past
+    /// `count` is never issued, and it marches all workers through the schedule in
+    /// lockstep. See the note in `soak_light::run_connection`.
+    sched_offset: usize,
     in_flight: usize,
     count: usize,
     concurrency: usize,
@@ -111,7 +117,7 @@ impl LightSpammer {
     fn fill_window(&mut self) {
         let Some(peer) = self.peer else { return };
         while self.in_flight < self.concurrency && self.issued < self.count {
-            let idx = self.schedule[self.issued % self.schedule.len()];
+            let idx = self.schedule[(self.sched_offset + self.issued) % self.schedule.len()];
             let (hash, num) = self.head.borrow().clone();
             let payload = self.methods[idx].1.build(&hash, num);
             let id = self
@@ -557,6 +563,7 @@ pub async fn spam_light(
                 log::error!("worker {id}: dial failed: {e}");
                 return WorkerReport::empty(n);
             }
+            let sched_offset = rand::thread_rng().next_u32() as usize % schedule_c.len();
             let mut worker = LightSpammer {
                 id,
                 swarm,
@@ -568,6 +575,7 @@ pub async fn spam_light(
                 schedule: schedule_c,
                 pending: HashMap::new(),
                 issued: 0,
+                sched_offset,
                 in_flight: 0,
                 count,
                 concurrency,
