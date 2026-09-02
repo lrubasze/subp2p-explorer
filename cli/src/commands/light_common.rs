@@ -675,7 +675,7 @@ pub(crate) async fn head_source(
     rpc_url: Url,
     fixed_block: Option<String>,
 ) -> Result<watch::Receiver<Head>, Box<dyn Error>> {
-    let rpc = client(rpc_url).await?;
+    let rpc = client(rpc_url.clone()).await?;
 
     if let Some(block) = fixed_block {
         let block = format!("0x{}", block.trim_start_matches("0x"));
@@ -697,34 +697,108 @@ pub(crate) async fn head_source(
     let hash = hex::decode(head_hash.trim_start_matches("0x"))?;
     let (tx, rx) = watch::channel((hash, num));
 
-    // Keep the head fresh in the background.
+    // Keep the head fresh in the background, reconnecting for as long as the run
+    // lasts.
+    //
+    // This used to be a single subscription whose task exited on the first stream
+    // error, which is a silent failure of the worst kind: the head freezes, the
+    // run keeps completing requests at full rate, and once the frozen block falls
+    // out of the node's ~256-block state window every response comes back with no
+    // proof — off a path that does no trie work at all. A 12-hour soak would
+    // report healthy throughput for the error path and nobody would see it in the
+    // rate. So: retry forever, and shout when the head goes stale.
     tokio::spawn(async move {
-        let mut sub = match rpc
-            .subscribe::<serde_json::Value, _>(
-                "chain_subscribeFinalizedHeads",
-                rpc_params![],
-                "chain_unsubscribeFinalizedHeads",
-            )
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                log::warn!("head subscription failed, using seed block only: {e}");
-                return;
-            }
-        };
-        while let Some(Ok(header)) = sub.next().await {
-            let Some(num) = header_number(&header) else {
-                continue;
+        // Kusama finalises roughly every 6 s; ~256 blocks of state (~25 min) is
+        // the window before a frozen head starts returning proofless responses.
+        // Warn long before that, at 10 missed blocks.
+        const STALE_AFTER: Duration = Duration::from_secs(60);
+        let mut backoff = Duration::from_secs(1);
+        let mut rpc = Some(rpc);
+        let mut last_ok = std::time::Instant::now();
+
+        loop {
+            // Rebuild the client if the previous connection died: a jsonrpsee
+            // client does not recover from a dropped transport.
+            let conn = match rpc.take() {
+                Some(c) => c,
+                // `client`'s error is a plain `Box<dyn Error>`, which is not
+                // `Send`, so it must not be held across the sleep below — flatten
+                // it to a String before any await.
+                None => match client(rpc_url.clone()).await.map_err(|e| e.to_string()) {
+                    Ok(c) => {
+                        log::info!("head tracker: reconnected to the RPC");
+                        backoff = Duration::from_secs(1);
+                        c
+                    }
+                    Err(e) => {
+                        log::warn!("head tracker: RPC reconnect failed: {e}");
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        continue;
+                    }
+                },
             };
-            if let Ok(hash_hex) = rpc
-                .request::<String, _>("chain_getBlockHash", rpc_params![num])
+
+            match conn
+                .subscribe::<serde_json::Value, _>(
+                    "chain_subscribeFinalizedHeads",
+                    rpc_params![],
+                    "chain_unsubscribeFinalizedHeads",
+                )
                 .await
             {
-                if let Ok(bytes) = hex::decode(hash_hex.trim_start_matches("0x")) {
-                    let _ = tx.send((bytes, num));
+                Ok(mut sub) => {
+                    backoff = Duration::from_secs(1);
+                    loop {
+                        match sub.next().await {
+                            Some(Ok(header)) => {
+                                let Some(num) = header_number(&header) else {
+                                    continue;
+                                };
+                                match conn
+                                    .request::<String, _>("chain_getBlockHash", rpc_params![num])
+                                    .await
+                                {
+                                    Ok(hash_hex) => {
+                                        if let Ok(bytes) =
+                                            hex::decode(hash_hex.trim_start_matches("0x"))
+                                        {
+                                            let _ = tx.send((bytes, num));
+                                            last_ok = std::time::Instant::now();
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::warn!("head tracker: block hash lookup failed: {e}");
+                                        break;
+                                    }
+                                }
+                            }
+                            Some(Err(e)) => {
+                                log::warn!("head tracker: subscription error: {e}");
+                                break;
+                            }
+                            // Stream ended: the server closed the subscription.
+                            None => {
+                                log::warn!("head tracker: subscription closed by the server");
+                                break;
+                            }
+                        }
+                    }
                 }
+                Err(e) => log::warn!("head tracker: subscribe failed: {e}"),
             }
+
+            // Dropped: the client is suspect, so the next iteration rebuilds it.
+            let stale = last_ok.elapsed();
+            if stale > STALE_AFTER {
+                log::error!(
+                    "head tracker: execution block is {}s stale — responses may carry no proof \
+                     once it leaves the node's state window; treat this run's numbers as suspect",
+                    stale.as_secs()
+                );
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(30));
         }
     });
 
