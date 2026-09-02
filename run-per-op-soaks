@@ -1,0 +1,161 @@
+#!/bin/bash
+
+# Sustained soak of each operation ON ITS OWN, back to back, inside a hard deadline.
+#
+#   DEADLINE_UTC="2026-09-02 06:45" ./run-per-op-soaks
+#   WAIT_FOR_PID=1 ./run-per-op-soaks     # queue behind a running soak first
+#
+# WHY, given the sweep already ran each operation in isolation. Those were 30 s
+# points sized to find a ceiling; they say nothing about what an operation does over
+# tens of minutes. And the long run is a *mix*, which blends per-operation
+# behaviour: soak-light reports per-method totals for the whole run and its drift
+# snapshots are aggregate only, so a single request type degrading slowly is
+# invisible there. This fills that gap — one request type, sustained, with its own
+# node.csv and health.csv.
+#
+# THE RATE. Each operation runs at 50% of *its own* solo ceiling. That is the right
+# reading here and the wrong one for a mix: alone, an operation has the whole node,
+# so half its own ceiling is half the node. In a mix the shares have to be summed by
+# cost instead (see `mix-rate`), because seven operations each at half their own
+# ceiling would be several times the node's capacity.
+#
+# CONCURRENCY comes from Little's law per operation (rate x serve time), times 4 for
+# headroom, clamped to [4, 16]. It must stay below the node's 20-slot light queue —
+# above it, the measurement becomes queue admission rather than serving, and the
+# pool inflates into congestion collapse. MEASURED: an uncapped pool shed 20% of a
+# load that sheds 0% when capped.
+#
+# THE DEADLINE is a hard stop, not a target. Durations are recomputed before every
+# operation as (time left / operations left), so the schedule absorbs a late start
+# or a slow run instead of overrunning. An operation that cannot get its minimum is
+# skipped and named, rather than run too short to mean anything.
+
+set -u
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+HOST=${HOST:-dev-machine2}
+CSV=${CSV:-results/serving-2026-09-01/sweep/sweep.csv}
+CAMPAIGN=${CAMPAIGN:-results/serving-2026-09-01/per-op}
+DEADLINE_UTC=${DEADLINE_UTC:-2026-09-02 06:45}
+UTIL=${UTIL:-0.5}
+
+# Per-run overhead: idle shoulders, generator startup, the poll loop's 60 s
+# granularity, monitor teardown.
+PRE_SLEEP=${PRE_SLEEP:-20}
+POST_SLEEP=${POST_SLEEP:-60}
+OVERHEAD=${OVERHEAD:-180}
+MIN_DURATION=${MIN_DURATION:-600}
+MAX_DURATION=${MAX_DURATION:-2700}
+
+# Most-interesting first, so a truncated schedule loses the least. The heavy call is
+# the CPU extreme and the likeliest to drift; the large read is the byte extreme.
+ORDER=${ORDER:-"hcall lread mcall sread bcall mread qcall"}
+
+ACCOUNT_PREFIX=26aa394eea5630e07c48ae0c9558cef7b99d880ec681799c0cf30e8886371da9
+VALIDATORS_KEY=cec5070d609dd3497f72bde07fc96ba088dcde934c658227ee1dfafcd6e16903
+declare -A METHOD=(
+    [sread]="read:${ACCOUNT_PREFIX}:rand48"
+    [mread]="read:${VALIDATORS_KEY}"
+    [lread]="warp_code"
+    [qcall]="Core_version"
+    [mcall]="account_nonce"
+    [bcall]="babe_configuration"
+    [hcall]="Metadata_metadata"
+)
+
+[ -f "$CSV" ] || { echo "no sweep data at $CSV" >&2; exit 1; }
+deadline=$(date -u -d "$DEADLINE_UTC" +%s) || exit 1
+
+# Optionally wait for an in-flight soak to finish first.
+if [ "${WAIT_FOR_PID:-0}" = 1 ]; then
+    echo "waiting for the running soak on $HOST to finish..."
+    while ssh -n "$HOST" 'test -f ~/soak-light.pid && kill -0 $(cat ~/soak-light.pid) 2>/dev/null'; do
+        sleep 60
+    done
+    echo "previous soak done at $(date -Is); starting per-op schedule"
+    sleep 60   # let the node settle before the next measurement
+fi
+
+# Ceiling = peak of the curve; serve time = p50 at one client.
+read_op() {
+    awk -F, -v op="$1" 'NR>1 && $1==op {
+        if ($6+0 > peak) peak = $6+0
+        if ($3+0 == 1) serve = $14+0
+    } END { printf "%d %.4f", peak, serve }' "$CSV"
+}
+
+mkdir -p "$CAMPAIGN"
+SUMMARY="$CAMPAIGN/per-op.csv"
+[ -f "$SUMMARY" ] || echo "op,method,rate,duration_s,clients,max_concurrent,offered_ps,served_ps,ok,unserved,shed,timeout,err,p50_ms,p90_ms,p99_ms,rss_before_kb,rss_after_kb,rss_idle_kb" > "$SUMMARY"
+
+remaining=$(echo "$ORDER" | wc -w)
+echo "deadline : $(date -u -d "@$deadline" -Is) ($remaining operations)"
+echo "summary  : $SUMMARY"
+echo
+
+for op in $ORDER; do
+    now=$(date +%s)
+    left=$(( deadline - now ))
+    if [ "$remaining" -le 0 ]; then break; fi
+    dur=$(( left / remaining - OVERHEAD ))
+    [ "$dur" -gt "$MAX_DURATION" ] && dur=$MAX_DURATION
+    if [ "$dur" -lt "$MIN_DURATION" ]; then
+        echo "SKIP $op — only ${left}s left, below the ${MIN_DURATION}s minimum for a meaningful run"
+        remaining=$(( remaining - 1 ))
+        continue
+    fi
+
+    read -r ceiling serve <<< "$(read_op "$op")"
+    if [ -z "${ceiling:-}" ] || [ "$ceiling" -eq 0 ]; then
+        echo "SKIP $op — no ceiling in $CSV"
+        remaining=$(( remaining - 1 ))
+        continue
+    fi
+
+    rate=$(awk -v c="$ceiling" -v u="$UTIL" 'BEGIN { printf "%d", (c * u < 1 ? 1 : c * u) }')
+    mc=$(awk -v r="$rate" -v s="$serve" 'BEGIN {
+        c = 4 * r * s / 1000
+        c = (c < 4 ? 4 : (c > 16 ? 16 : int(c + 0.999)))
+        printf "%d", c
+    }')
+    clients=$(( mc * 10 ))
+
+    out="$CAMPAIGN/$op"
+    echo "=== $op: ${METHOD[$op]} — ${rate}/s (50% of ${ceiling}/s) for ${dur}s, cap $mc ==="
+    RATE=$rate DURATION=$dur CLIENTS=$clients MAX_CONCURRENT=$mc \
+        METHOD="${METHOD[$op]}" OUT_DIR="$out" \
+        PRE_SLEEP=$PRE_SLEEP POST_SLEEP=$POST_SLEEP \
+        REMOTE_LOG=/home/ubuntu/soak-$op.log REMOTE_PIDFILE=/home/ubuntu/soak-$op.pid \
+        "$HERE/run-light-soak" > "$out.log" 2>&1
+
+    f="$out/soak.txt"
+    if [ -f "$f" ]; then
+        read -r offered served < <(awk -F'[ |]+' '/^offered:/ { print $2, $7 }' "$f")
+        read -r ok unserved shed timeout err < <(awk '/^requests:/ {
+            for (i=2;i<=NF;i++) { split($i,kv,"="); v[kv[1]]=kv[2] }
+            print v["ok"]+0, v["unserved"]+0, v["shed"]+0, v["timeout"]+0, v["err"]+0 }' "$f")
+        read -r p50 p90 p99 < <(awk '/^send->resp ms:/ {
+            for (i=3;i<=NF;i++) { split($i,kv,"=")
+                if (kv[1]=="p50") a=kv[2]; if (kv[1]=="p90") b=kv[2]; if (kv[1]=="p99") c=kv[2] }
+            print a+0, b+0, c+0 }' "$f")
+        rb=$(awk -F= '/^rss_kb=/{print $2}' "$out/health.before" 2>/dev/null)
+        ra=$(awk -F= '/^rss_kb=/{print $2}' "$out/health.after" 2>/dev/null)
+        ri=$(awk -F= '/^rss_kb=/{print $2}' "$out/health.idle" 2>/dev/null)
+        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+            "$op" "${METHOD[$op]}" "$rate" "$dur" "$clients" "$mc" \
+            "${offered:-}" "${served:-}" "${ok:-}" "${unserved:-}" "${shed:-}" \
+            "${timeout:-}" "${err:-}" "${p50:-}" "${p90:-}" "${p99:-}" \
+            "${rb:-}" "${ra:-}" "${ri:-}" >> "$SUMMARY"
+        echo "  served ${served:-?}/s  ok=${ok:-?} shed=${shed:-?} unserved=${unserved:-?} p50=${p50:-?}ms"
+        awk -v b="${rb:-0}" -v a="${ra:-0}" -v i="${ri:-0}" 'BEGIN {
+            if (b > 0) printf "  rss %.2f -> %.2f GB under load (%+.0f MB), %.2f after idle (%+.0f MB returned)\n",
+                b/1048576, a/1048576, (a-b)/1024, i/1048576, (a-i)/1024 }'
+    else
+        echo "  FAILED — see $out.log"
+    fi
+    remaining=$(( remaining - 1 ))
+    echo
+done
+
+echo "done at $(date -Is)"
+column -s, -t "$SUMMARY" 2>/dev/null || cat "$SUMMARY"

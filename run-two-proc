@@ -1,0 +1,93 @@
+#!/bin/bash
+
+# Is a ceiling the node's, or ours? Run the same total concurrency as two
+# independent generator processes instead of one.
+#
+#   OP_METHOD=warp_code CLIENTS=8 ./run-two-proc
+#
+# THE LOGIC. A single generator that tops out could be topping out for two very
+# different reasons: the node cannot serve faster, or our own process cannot ask
+# faster (one event loop, one connection pool, response bytes to memcpy). Split
+# the same in-flight count across two processes:
+#
+#   - aggregate stays flat  -> the node was the limit. It is a real ceiling.
+#   - aggregate roughly doubles -> we were the limit. It was never a ceiling.
+#
+# This is the cheapest decisive test in the toolbox and it already settled the
+# warp-proof number: 2 x concurrency-10 gave 25.5/s against 26.2/s for
+# 1 x concurrency-20 — same total in flight, same throughput, so the node was the
+# constraint.
+#
+# The one to be suspicious of is the large read: ~690/s of 1.73 MB proofs is
+# ~1.19 GB/s of near-pure memcpy, which is exactly the shape of a client-side
+# limit. Until this test says otherwise, treat that figure as a floor.
+
+set -u
+
+HOST=${HOST:-dev-machine2}
+BIN=${BIN:-/home/ubuntu/bin/subp2p-explorer-cli}
+URL=${URL:-ws://127.0.0.1:9944}
+ADDRESS=${ADDRESS:-/ip4/127.0.0.1/tcp/30333}
+RATE=${RATE:-40000}
+DURATION=${DURATION:-30}
+OP_METHOD=${OP_METHOD:?set OP_METHOD, e.g. warp_code}
+# Total in-flight requests to hold, split across the two processes.
+CLIENTS=${CLIENTS:-8}
+OUT_DIR=${OUT_DIR:-results/two-proc-$(date +%Y%m%d-%H%M)}
+
+half=$(( CLIENTS / 2 ))
+[ "$half" -ge 1 ] || { echo "CLIENTS must be >= 2" >&2; exit 1; }
+
+mkdir -p "$OUT_DIR"
+HERE=$(cd "$(dirname "$0")" && pwd)
+
+run_one() {
+    ssh -n "$HOST" "RUST_LOG=warn $BIN soak-light \
+        --url $URL --address $ADDRESS --method '$OP_METHOD' \
+        --rate $RATE --duration $DURATION --clients $1" > "$2" 2>&1
+}
+
+served_of() { awk -F'[ |]+' '/^offered:/ { print $7 }' "$1"; }
+shed_of()   { awk '/^requests:/ { for (i=2;i<=NF;i++) { split($i,kv,"="); if (kv[1]=="shed") print kv[2]+0 } }' "$1"; }
+
+echo "method   : $OP_METHOD"
+echo "one proc : --clients $CLIENTS"
+echo "two proc : --clients $half, twice, concurrently"
+echo
+
+"$HERE/run-monitor-health" --once > "$OUT_DIR/health.before"
+
+echo "--- single process, $CLIENTS in flight ---"
+run_one "$CLIENTS" "$OUT_DIR/single.txt"
+one=$(served_of "$OUT_DIR/single.txt")
+echo "served: ${one}/s  (shed $(shed_of "$OUT_DIR/single.txt"))"
+
+sleep 10
+
+echo "--- two processes, $half in flight each ---"
+run_one "$half" "$OUT_DIR/pair-a.txt" &
+pa=$!
+run_one "$half" "$OUT_DIR/pair-b.txt" &
+pb=$!
+wait $pa $pb
+a=$(served_of "$OUT_DIR/pair-a.txt")
+b=$(served_of "$OUT_DIR/pair-b.txt")
+echo "served: ${a}/s + ${b}/s"
+
+"$HERE/run-monitor-health" --once > "$OUT_DIR/health.after"
+
+awk -v one="$one" -v a="$a" -v b="$b" 'BEGIN {
+    agg = a + b
+    printf "\nsingle %d/s   two-process aggregate %d/s   ratio %.2fx\n", one, agg, (one > 0 ? agg / one : 0)
+    if (one <= 0) { print "single-process run produced nothing — check the output"; exit }
+    r = agg / one
+    if (r > 1.5)
+        print "VERDICT: the single-process figure was OUR limit, not the node ceiling."
+    else if (r > 1.15)
+        printf "VERDICT: partly client-bound — the node serves at least %d/s.\n", agg
+    else
+        print "VERDICT: node-bound. The single-process figure is a real ceiling."
+}'
+
+echo
+echo "artifacts in $OUT_DIR"

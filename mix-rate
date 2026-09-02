@@ -1,0 +1,116 @@
+#!/bin/bash
+
+# Turn the sweep's measured ceilings into the offered rate and `--method` string
+# for a mixed soak at a target aggregate utilisation.
+#
+#   ./mix-rate results/serving-2026-09-01/sweep/sweep.csv
+#   TARGET_UTIL=0.5 SOAK_HOURS=12 ./mix-rate <csv>
+#
+# THE ARITHMETIC. Operations share one node, so they cannot each run at 50% of
+# their own solo ceiling — that sums to several times the node's capacity. Each
+# request of operation i costs `1/ceiling_i` of the node, so for weights w_i
+# (total W) at an aggregate offered rate R:
+#
+#     u = R * sum_i (w_i / W) / ceiling_i
+#
+# and the rate for a target utilisation is R = TARGET_UTIL / that sum. This is an
+# approximation in one specific way, stated here rather than buried: it assumes
+# the costs add linearly. They do not exactly — the operations have different
+# effective parallelism (MEASURED: 2.1 for the heavy call, 6.3 for a small read),
+# so a mix of cheap and expensive requests interleaves better than the sum
+# suggests. That makes the derived rate conservative, which is the right direction
+# for a soak whose point is that it holds.
+#
+# The ceiling per operation is the *peak* of its sweep curve, not the last point:
+# past the knee, throughput falls again from self-inflicted congestion collapse.
+#
+# WEIGHTS are a population model, not a measurement — the one judgement call in
+# this campaign. Defaults model a smoldot-ish client population: storage reads
+# dominate steady state; every transaction needs a nonce; warp sync contributes a
+# runtime download per client session; metadata is fetched once per runtime
+# version and then cached, so it is rare but very expensive.
+
+set -u
+
+CSV=${1:-}
+[ -n "$CSV" ] && [ -f "$CSV" ] || { echo "usage: $0 <sweep.csv>" >&2; exit 1; }
+
+TARGET_UTIL=${TARGET_UTIL:-0.5}
+SOAK_HOURS=${SOAK_HOURS:-12}
+
+# op:weight — out of whatever they sum to.
+WEIGHTS=${WEIGHTS:-"sread:600 mcall:150 mread:100 qcall:50 bcall:50 lread:20 hcall:1"}
+
+awk -F, -v weights="$WEIGHTS" -v util="$TARGET_UTIL" -v hours="$SOAK_HOURS" '
+NR == 1 { next }
+{
+    op = $1
+    # Peak of the curve, and the method string / proof size that produced it.
+    if ($6 + 0 > peak[op]) {
+        peak[op]   = $6 + 0
+        method[op] = $2
+        proof[op]  = $17 + 0
+        atc[op]    = $3 + 0
+    }
+}
+END {
+    n = split(weights, pairs, " ")
+    W = 0
+    for (i = 1; i <= n; i++) {
+        split(pairs[i], kv, ":")
+        ops[i] = kv[1]; w[kv[1]] = kv[2] + 0
+        W += kv[2] + 0
+        if (!(kv[1] in peak)) {
+            printf "no sweep data for op %s — run the sweep for it first\n", kv[1] > "/dev/stderr"
+            missing = 1
+        }
+    }
+    if (missing) exit 1
+
+    # sum of (share of requests) / (ceiling) = node fraction per offered request
+    cost = 0
+    for (i = 1; i <= n; i++) { o = ops[i]; cost += (w[o] / W) / peak[o] }
+    R = util / cost
+
+    printf "ceilings from %s\n\n", ARGV[1]
+    printf "%-7s %10s %8s %7s %9s %9s %9s %11s\n", \
+        "op", "ceiling/s", "atclient", "weight", "req_share", "rate/s", "util%", "MB/s"
+    tot_mb = 0
+    for (i = 1; i <= n; i++) {
+        o = ops[i]
+        share = w[o] / W
+        r = R * share
+        u = 100 * r / peak[o]
+        mb = r * proof[o] / 1048576
+        tot_mb += mb
+        tot_u += u
+        printf "%-7s %10d %8d %7d %8.1f%% %9.1f %8.1f%% %11.1f\n", \
+            o, peak[o], atc[o], w[o], 100 * share, r, u, mb
+    }
+    printf "%-7s %10s %8s %7d %8.1f%% %9.1f %8.1f%% %11.1f\n", \
+        "TOTAL", "", "", W, 100, R, tot_u, tot_mb
+
+    printf "\noffered rate  : %d/s  (aggregate utilisation %.0f%% of the node)\n", R, 100 * util
+    printf "byte rate     : %.0f MB/s  => %.1f TB over %sh\n", \
+        tot_mb, tot_mb * 3600 * hours / 1048576, hours
+    printf "\n"
+    printf "the budget is not the traffic: "
+    # Name the operation that eats the most node budget, and its request share.
+    bu = 0
+    for (i = 1; i <= n; i++) {
+        o = ops[i]
+        u = 100 * (R * w[o] / W) / peak[o]
+        if (u > bu) { bu = u; bo = o }
+    }
+    printf "%s is %.1f%% of requests but %.0f%% of the node\n", \
+        bo, 100 * w[bo] / W, 100 * bu / tot_u
+
+    printf "\nRATE=%d\n", R
+    printf "METHOD='"'"'"
+    for (i = 1; i <= n; i++) {
+        o = ops[i]
+        printf "%s%s@%d", (i > 1 ? "," : ""), method[o], w[o]
+    }
+    printf "'"'"'\n"
+}
+' "$CSV"

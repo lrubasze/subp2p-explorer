@@ -1,0 +1,243 @@
+#!/bin/bash
+
+# Saturation sweep: for each light operation, find the node's ceiling by sweeping
+# concurrency from 1 upward and stopping where throughput stops rising.
+#
+#   ./run-light-sweep                       # all operations
+#   OPS="sread meta" ./run-light-sweep      # a subset
+#   DURATION=60 ./run-light-sweep           # longer points
+#
+# WHY A CONCURRENCY SWEEP AND NOT A RATE SWEEP. `soak-light` is open-loop, but it
+# issues one request in flight per connection and `--clients` bounds the total
+# connections opened, so with `--rate` set far above anything achievable the pacer
+# always has permits banked and the run is effectively closed-loop at concurrency
+# = `--clients`. That makes `--clients` the independent variable, and it is the
+# one that matters:
+#
+#   - too few  -> you measure your own client. `shed=0` at a rate below target is
+#                 the tell: achievable rate is clients/latency, not node capacity.
+#   - too many -> congestion collapse. MEASURED on the 22 kB read: 40 clients gave
+#                 21,053/s, 80 gave 21,536/s at 20% shed, 160 gave 16,115/s at 46%
+#                 shed. A single run at 1500 clients reported 14,216/s, which is
+#                 32% below the real ceiling — all of it self-inflicted.
+#
+# So the ceiling is the *peak* of the curve, and it has to be approached from
+# below. The knee sits anywhere from 2 to 40+ clients depending on the operation,
+# which is why one client count cannot be carried between operations.
+#
+# Serve time comes from the 1-client point only. Past the knee, `send->resp` is
+# pure queueing: `Metadata_metadata` reads 15.4 ms at 2 clients and 155.2 ms at 20
+# for the *same* 128/s, each extra client adding exactly 1/128 s.
+#
+# Everything runs on the node itself over loopback, so no NIC or routed path is in
+# the way. The generator competes with the node for cores — that is the price of
+# removing the network, and it makes these figures conservative.
+
+set -u
+
+HOST=${HOST:-dev-machine2}
+# Absolute: the remote non-interactive shell is zsh and does not have ~/bin on
+# PATH, so a bare name resolves only in an interactive session.
+BIN=${BIN:-/home/ubuntu/bin/subp2p-explorer-cli}
+# The node's own RPC: supplies genesis and the finalized-head subscription. Local,
+# so no external dependency and no added latency. State is pruned to ~256 blocks,
+# so the execution block has to stay fresh — hence a head subscription, not a
+# pinned block.
+URL=${URL:-ws://127.0.0.1:9944}
+ADDRESS=${ADDRESS:-/ip4/127.0.0.1/tcp/30333}
+RATE=${RATE:-40000}
+DURATION=${DURATION:-30}
+CAMPAIGN=${CAMPAIGN:-serving-$(date +%Y-%m-%d)}
+OUT_ROOT=${OUT_ROOT:-results/$CAMPAIGN/sweep}
+COOLDOWN=${COOLDOWN:-5}
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+
+# --- the operation set -------------------------------------------------------
+#
+# Two axes, deliberately: call-vs-read (the one that actually predicts cost) and
+# response size (the one everybody assumes predicts cost). Reads and calls are
+# paired on identical data so the difference is purely Wasm execution:
+# `account_nonce` reads System::Account[random] behind a runtime call, and `sread`
+# reads the same trie path with no Wasm. Their proofs are 2425 vs 2426 bytes.
+#
+# Keys verified against the finalized head before this file was written:
+# Session::Validators is 22,400 B (700 validators x 32 B + 2 B length prefix, which
+# cross-checks against Babe::Authorities at 700 x 40 B + 2), and `:code` is
+# 1,724,631 B.
+ACCOUNT_PREFIX=26aa394eea5630e07c48ae0c9558cef7b99d880ec681799c0cf30e8886371da9
+VALIDATORS_KEY=cec5070d609dd3497f72bde07fc96ba088dcde934c658227ee1dfafcd6e16903
+
+declare -A METHOD=(
+    # zsh applies the :r history modifier to $VAR:rand48, so the brace is not
+    # optional even though this script is bash.
+    [sread]="read:${ACCOUNT_PREFIX}:rand48"   # small read,  ~2.4 kB
+    [mread]="read:${VALIDATORS_KEY}"          # mid read,    ~23.4 kB
+    [lread]="warp_code"                       # large read,  ~1.73 MB (:code)
+    [qcall]="Core_version"                    # quick call,  1 B
+    [mcall]="account_nonce"                   # mid call,    ~2.4 kB
+    [bcall]="babe_configuration"              # large-resp call, ~29 kB
+    [hcall]="Metadata_metadata"               # heavy call,  887 B, ~16.7 ms
+)
+
+# Ladders start at 1 (for serve time) and stop well short of the collapse region.
+# Prior knees: hcall at 2, mcall at ~8, mread at ~40, sread not reached by 20.
+declare -A LADDER=(
+    [sread]="1 2 4 8 16 24 32 48 64"
+    [mread]="1 2 4 8 16 24 32 48 64"
+    [lread]="1 2 4 8 16"
+    [qcall]="1 2 4 8 16 24 32 48"
+    [mcall]="1 2 4 6 8 12 16 24"
+    [bcall]="1 2 4 6 8 12 16 24"
+    [hcall]="1 2 3 4 6 8 12"
+)
+
+DEFAULT_OPS="sread mread lread qcall mcall bcall hcall"
+OPS=${OPS:-$DEFAULT_OPS}
+
+# Override the ladder for whichever ops this invocation runs. Needed when a first
+# pass ends with the peak sitting on the last rung and no shedding anywhere — that
+# is not a ceiling, it is an unfinished ladder, and the fix is to extend it rather
+# than to report the last point.
+#
+#   OPS=lread CLIENTS_LIST="24 32 48 64" ./run-light-sweep
+CLIENTS_LIST=${CLIENTS_LIST:-}
+
+# --- helpers -----------------------------------------------------------------
+
+# Pull one `key=value` out of a health snapshot file.
+hval() { awk -F= -v k="$2" '$1==k { print $2 }' "$1"; }
+
+mkdir -p "$OUT_ROOT"
+SUMMARY="$OUT_ROOT/sweep.csv"
+if [ ! -f "$SUMMARY" ]; then
+    echo "op,method,clients,duration_s,offered_ps,served_ps,shed_ps,ok,unserved,shed,timeout,err,aborted,p50_ms,p90_ms,p99_ms,avg_proof_b,node_ok_delta,node_fullchan_delta,node_cpu_s,rss_kb_before,rss_kb_after,cache_hit_pct" > "$SUMMARY"
+fi
+
+echo "campaign : $CAMPAIGN"
+echo "target   : $HOST $ADDRESS (loopback, generator on the node)"
+echo "points   : ${DURATION}s each, --rate $RATE (closed-loop: concurrency = --clients)"
+echo "ops      : $OPS"
+echo "summary  : $SUMMARY"
+echo
+
+# Sync the health payload once, then reuse it for every snapshot.
+SKIP_SYNC=0 "$HERE/run-monitor-health" --once > /dev/null || {
+    echo "health monitor unavailable" >&2
+    exit 1
+}
+
+for op in $OPS; do
+    m=${METHOD[$op]:-}
+    if [ -z "$m" ]; then
+        echo "unknown op '$op' (known: $DEFAULT_OPS)" >&2
+        continue
+    fi
+    dir="$OUT_ROOT/$op"
+    mkdir -p "$dir"
+    echo "=== $op: $m ==="
+
+    best=0
+    below=0
+    for n in ${CLIENTS_LIST:-${LADDER[$op]}}; do
+        base="$dir/c$n"
+        SKIP_SYNC=1 "$HERE/run-monitor-health" --once > "$base.health.before"
+
+        t0=$(date +%s)
+        ssh -n "$HOST" "RUST_LOG=warn $BIN soak-light \
+            --url $URL --address $ADDRESS --method '$m' \
+            --rate $RATE --duration $DURATION --clients $n" \
+            > "$base.txt" 2>&1
+        rc=$?
+        t1=$(date +%s)
+
+        SKIP_SYNC=1 "$HERE/run-monitor-health" --once > "$base.health.after"
+
+        if [ $rc -ne 0 ]; then
+            echo "  clients=$n: FAILED (rc=$rc), see $base.txt"
+            continue
+        fi
+
+        # Client-side figures, straight out of the run's own summary block.
+        # "offered: N req/s (issued N) | served N req/s | shed N req/s" — with
+        # " | " collapsing to one separator, the rates land on 2, 7 and 10.
+        read -r offered served shed_ps < <(awk -F'[ |]+' '
+            /^offered:/ { print $2, $7, $10 }' "$base.txt")
+        read -r ok unserved shed timeout err aborted < <(awk '
+            /^requests:/ {
+                for (i = 2; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2] }
+                print v["ok"]+0, v["unserved"]+0, v["shed"]+0,
+                      v["timeout"]+0, v["err"]+0, v["aborted"]+0
+            }' "$base.txt")
+        read -r p50 p90 p99 < <(awk '
+            /^send->resp ms:/ {
+                for (i = 3; i <= NF; i++) {
+                    split($i, kv, "=")
+                    if (kv[1] == "p50") a = kv[2]
+                    if (kv[1] == "p90") b = kv[2]
+                    if (kv[1] == "p99") c = kv[2]
+                }
+                print a+0, b+0, c+0
+            }' "$base.txt")
+        proof=$(awk '/avg proof=/ { for (i=1; i<=NF; i++) if ($i ~ /^proof=/) { gsub(/[^0-9]/, "", $i); print $i; exit } }' "$base.txt")
+
+        # Node-side cross-check. `_count` is exact; the client `ok` should match it
+        # to within a couple of requests. Anything else means the client figure is
+        # measuring something other than what the node served.
+        ok_b=$(hval "$base.health.before" light_ok)
+        ok_a=$(hval "$base.health.after" light_ok)
+        fc_b=$(hval "$base.health.before" light_fail_fullchan)
+        fc_a=$(hval "$base.health.after" light_fail_fullchan)
+        cpu_b=$(hval "$base.health.before" cpu_jiffies)
+        cpu_a=$(hval "$base.health.after" cpu_jiffies)
+        rss_b=$(hval "$base.health.before" rss_kb)
+        rss_a=$(hval "$base.health.after" rss_kb)
+        lh_b=$(hval "$base.health.before" tc_local_hits_node)
+        lh_a=$(hval "$base.health.after" tc_local_hits_node)
+        la_b=$(hval "$base.health.before" tc_local_att_node)
+        la_a=$(hval "$base.health.after" tc_local_att_node)
+        sh_b=$(hval "$base.health.before" tc_shared_hits_node)
+        sh_a=$(hval "$base.health.after" tc_shared_hits_node)
+
+        node_ok=$((ok_a - ok_b))
+        node_fc=$((fc_a - fc_b))
+        cpu_s=$(awk -v d=$((cpu_a - cpu_b)) 'BEGIN { printf "%.1f", d / 100 }')
+        # The parens are load-bearing: inside printf's argument list an unbracketed
+        # `la > 0` is parsed as an output redirection, not a comparison.
+        hit=$(awk -v lh=$((lh_a - lh_b)) -v sh=$((sh_a - sh_b)) -v la=$((la_a - la_b)) \
+            'BEGIN { printf "%.1f", (la > 0 ? 100 * (lh + sh) / la : 0) }')
+
+        printf '%s,%s,%d,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%s,%s,%s,%s\n' \
+            "$op" "$m" "$n" "$DURATION" "$offered" "$served" "$shed_ps" \
+            "$ok" "$unserved" "$shed" "$timeout" "$err" "$aborted" \
+            "$p50" "$p90" "$p99" "$proof" "$node_ok" "$node_fc" "$cpu_s" \
+            "$rss_b" "$rss_a" "$hit" >> "$SUMMARY"
+
+        # Cross-check delta, reported inline so a mismatch is impossible to miss.
+        drift=$(awk -v c="$ok" -v n="$node_ok" 'BEGIN { d = n - c; print (d < 0 ? -d : d) }')
+        flag=""
+        [ "$ok" -gt 0 ] && awk -v d="$drift" -v c="$ok" 'BEGIN { exit !(d > 0.01 * c) }' && flag="  <-- CLIENT/NODE MISMATCH"
+        printf '  clients=%-4s served=%-9s shed=%-8s p50=%-8s cpu=%ss node_ok=%s (dl %s)%s\n' \
+            "$n" "$served" "$shed" "$p50" "$cpu_s" "$node_ok" "$drift" "$flag"
+
+        # Stop once we are clearly past the peak: two consecutive points below 95%
+        # of the best seen. Beyond that the curve only measures self-inflicted
+        # congestion collapse, and it costs the node real work to produce.
+        if awk -v s="$served" -v b="$best" 'BEGIN { exit !(s > b) }'; then
+            best=$served
+            below=0
+        elif awk -v s="$served" -v b="$best" 'BEGIN { exit !(s < 0.95 * b) }'; then
+            below=$((below + 1))
+            if [ $below -ge 2 ]; then
+                echo "  (past the peak: two points below 95% of ${best}/s — stopping ladder)"
+                break
+            fi
+        fi
+
+        sleep "$COOLDOWN"
+    done
+    echo
+    sleep "$COOLDOWN"
+done
+
+echo "done. summary: $SUMMARY"

@@ -1,0 +1,172 @@
+#!/bin/bash
+
+# Long-duration mixed-operation soak: can one full node keep serving light
+# requests for hours, and stay healthy while doing it?
+#
+#   OUT_DIR=results/serving-2026-09-01/soak-12h DURATION=43200 ./run-light-soak
+#
+# Everything runs on the node over loopback, so no NIC is in the path. Two
+# monitors sample the node for the whole window (node.csv: process + block
+# heights; health.csv: the node's own view of the light path, finality, peers and
+# trie cache). Both are started before the load and stopped after it, so the
+# traces bracket the run and the idle shoulders are visible at each end.
+#
+# THE MIX. One process offering a weighted mix, rather than one operation at a
+# time: a real node faces a population of clients, not a monoculture. Weights
+# are a plausible population, not a measurement — see WEIGHTS below.
+#
+# THE RATE. Operations share one node, so they cannot each run at 50% of their
+# own solo ceiling (that would sum to several times the node's capacity). The
+# offered rate is set so *aggregate* utilisation is ~50%:
+#
+#     cost_i = 1 / ceiling_i                 (fraction of the node per request)
+#     u      = R * sum_i (w_i / W) * cost_i   (W = total weight)
+#     R      = TARGET_UTIL / sum_i (w_i / W) * cost_i
+#
+# `mix-rate` does that arithmetic from the sweep's measured ceilings, so the rate
+# is derived from this campaign's own numbers rather than carried in by hand.
+#
+# WHY 50%. It leaves the node headroom for its actual job (importing and
+# finalising Kusama), so shedding should sit near zero and any creep over hours is
+# real signal rather than saturation noise. A run at 95% would spend the whole
+# window measuring queue admission instead.
+#
+# NO SYNTHETIC PEERS. Every prior long run here held 2000 fake peers, so peers
+# were never ruled out as the cause of the ~150-200 MB/h RSS growth seen in all of
+# them. This window is light-load-only against the node's real peers, which makes
+# it the first zero-added-peer long run and turns RSS growth into a question this
+# run can actually answer.
+#
+# KNOWN LIMITATION, stated up front. `soak-light` gates the aggregate rate with a
+# token bucket and issues one request in flight per connection, so concurrency
+# settles at ~rate x latency — a handful of connections — no matter how large
+# `--clients` is. `--clients` buys connection *churn* (each retires after
+# rate*duration/clients requests and is replaced), not a standing population. So
+# this measures a node serving a given request rate; it does NOT model thousands
+# of simultaneously connected light clients. That gap needs a tool change.
+
+set -u
+
+HOST=${HOST:-dev-machine2}
+BIN=${BIN:-/home/ubuntu/bin/subp2p-explorer-cli}
+URL=${URL:-ws://127.0.0.1:9944}
+ADDRESS=${ADDRESS:-/ip4/127.0.0.1/tcp/30333}
+
+DURATION=${DURATION:-43200}
+RATE=${RATE:?set RATE (use ./mix-rate to derive it from the sweep)}
+METHOD=${METHOD:?set METHOD (the weighted mix)}
+# Total connections over the window. Sets churn, not concurrency: each connection
+# retires after rate*duration/clients requests and a fresh identity replaces it.
+CLIENTS=${CLIENTS:-1024}
+# Cap on simultaneous connections, and NOT a formality — leaving it at the 8192
+# default lets the connection pool inflate into congestion collapse.
+#
+# `soak-light` grows the pool whenever the pacer has unconsumed permits, which
+# feeds back on itself: more connections -> the 20-slot light queue overflows ->
+# latency rises -> permits go unconsumed -> more connections. MEASURED at
+# rate=6657 with 4096 clients over 60 s: the pool reached 128 concurrent and shed
+# **20%** of all requests. Capping at 16 on the identical load shed **zero** and
+# served the full offered rate. Same node, same rate — the difference was entirely
+# self-inflicted.
+#
+# Size it from Little's law, not by feel: concurrency = rate x mean serve time.
+# For this mix that is 6657 x 0.388 ms = 2.6, so 16 is already ~6x headroom while
+# staying below the node's 20-slot queue. A cap far above the queue depth measures
+# queue admission instead of capacity.
+MAX_CONCURRENT=${MAX_CONCURRENT:-16}
+OUT_DIR=${OUT_DIR:-results/soak-$(date +%Y%m%d-%H%M)}
+HEALTH_INTERVAL=${HEALTH_INTERVAL:-15}
+NODE_INTERVAL=${NODE_INTERVAL:-5}
+# Idle shoulders either side of the load, so "before" and "after" are measured
+# rather than assumed. The trailing one is where you see how much RSS comes back
+# when load stops — the difference between a cache that grew and a leak — so keep
+# it generous on long runs and trim it only when the schedule is tight.
+PRE_SLEEP=${PRE_SLEEP:-30}
+POST_SLEEP=${POST_SLEEP:-120}
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+mkdir -p "$OUT_DIR"
+
+lifetime=$(( RATE * DURATION / CLIENTS ))
+cat <<EOF | tee "$OUT_DIR/run.meta"
+campaign  : $OUT_DIR
+target    : $HOST $ADDRESS (loopback)
+duration  : ${DURATION}s ($(awk -v d="$DURATION" 'BEGIN { printf "%.1f", d / 3600 }')h)
+rate      : ${RATE}/s offered
+clients   : $CLIENTS total connections (~$lifetime requests each, then replaced)
+concurrent: $MAX_CONCURRENT max simultaneous
+method    : $METHOD
+started   : $(date -Is)
+EOF
+echo
+
+# --- monitors ----------------------------------------------------------------
+INTERVAL=$NODE_INTERVAL OUT_DIR=$OUT_DIR "$HERE/run-monitor-node" &
+MON_NODE=$!
+INTERVAL=$HEALTH_INTERVAL OUT_DIR=$OUT_DIR "$HERE/run-monitor-health" &
+MON_HEALTH=$!
+
+cleanup() {
+    kill $MON_NODE $MON_HEALTH 2>/dev/null
+    wait $MON_NODE $MON_HEALTH 2>/dev/null
+}
+trap cleanup EXIT INT TERM
+
+# Let the monitors write an idle shoulder before the load starts, so "before" is
+# measured rather than assumed.
+sleep "$PRE_SLEEP"
+"$HERE/run-monitor-health" --once > "$OUT_DIR/health.before"
+
+# --- load --------------------------------------------------------------------
+#
+# Launch detached on the node and poll, rather than holding the load on this
+# ssh session's stdout for twelve hours. A dropped ssh would otherwise take the
+# run with it — and the whole point of a 12h window is that it is expensive to
+# repeat. The remote log is pulled back periodically so partial results survive
+# even if this side dies.
+REMOTE_LOG=${REMOTE_LOG:-/home/ubuntu/soak-light.log}
+REMOTE_PIDFILE=${REMOTE_PIDFILE:-/home/ubuntu/soak-light.pid}
+
+echo "starting ${DURATION}s soak at $(date -Is)..."
+ssh -n "$HOST" "rm -f '$REMOTE_LOG' '$REMOTE_PIDFILE'; \
+    setsid nohup env RUST_LOG=warn $BIN soak-light \
+        --url $URL --address $ADDRESS --method '$METHOD' \
+        --rate $RATE --duration $DURATION --clients $CLIENTS \
+        --max-concurrent $MAX_CONCURRENT \
+        > '$REMOTE_LOG' 2>&1 < /dev/null & \
+    echo \$! > '$REMOTE_PIDFILE'; cat '$REMOTE_PIDFILE'"
+rpid=$(ssh -n "$HOST" "cat '$REMOTE_PIDFILE' 2>/dev/null")
+[ -n "$rpid" ] || { echo "failed to launch the remote soak" >&2; exit 1; }
+echo "remote pid $rpid, log $REMOTE_LOG"
+
+# Poll until it exits. The deadline is a backstop: if the process vanishes early
+# the loop notices within a minute, and if it overruns we stop waiting rather
+# than hang forever.
+end=$(( $(date +%s) + DURATION + 300 ))
+while [ "$(date +%s)" -lt "$end" ]; do
+    sleep 60
+    if ! ssh -n "$HOST" "kill -0 $rpid 2>/dev/null"; then
+        break
+    fi
+    scp -q "$HOST:$REMOTE_LOG" "$OUT_DIR/soak.txt" 2>/dev/null || true
+done
+scp -q "$HOST:$REMOTE_LOG" "$OUT_DIR/soak.txt" 2>/dev/null || true
+rc=0
+echo "soak finished at $(date -Is)"
+
+"$HERE/run-monitor-health" --once > "$OUT_DIR/health.after"
+# Idle shoulder on the far side: how much RSS comes back when load stops is the
+# difference between a cache that grew and a leak.
+sleep "$POST_SLEEP"
+"$HERE/run-monitor-health" --once > "$OUT_DIR/health.idle"
+
+cleanup
+trap - EXIT INT TERM
+
+# --- summary -----------------------------------------------------------------
+echo
+tail -30 "$OUT_DIR/soak.txt"
+echo
+"$HERE/chain-drift" "$OUT_DIR" || true
+echo
+echo "artifacts in $OUT_DIR: soak.txt node.csv health.csv health.{before,after,idle} run.meta"

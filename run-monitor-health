@@ -1,0 +1,83 @@
+#!/bin/bash
+
+# Sample the node's own view of its health while it serves light requests.
+#
+# Companion to `run-monitor-node`, which samples the *process* (cpu/rss/fds) and
+# the block heights. This one adds what the node thinks about the requests it is
+# serving, and whether it is still doing its real job. Kept as a separate file
+# rather than extra columns on node.csv, because `report/build` reads that file
+# by column index.
+#
+#   ./run-monitor-health --once             # one key=value snapshot on stdout
+#   OUT_DIR=results/x ./run-monitor-health  # health.csv, a row every INTERVAL s
+#
+# `--once` is for before/after deltas around a single run; the loop is for long
+# soaks. Every value is a *lifetime* counter as the node reports it — diff two
+# snapshots to get a rate, never read one absolutely.
+#
+# WHAT "HEALTHY" MEANS HERE. Five independent things, any of which can fail while
+# the others look fine:
+#
+#   1. serves what it is asked   light_ok delta. The success `_count` is exact and
+#                                is the cross-check for any client-side figure.
+#                                Its `_sum` sibling is not: litep2p stamps the
+#                                instant after the response future resolves, so it
+#                                under-reports serve time by ~8100x.
+#   2. sheds under pressure      light_fail_fullchan = the 20-slot queue
+#                                overflowed; light_fail_rejected = the handler
+#                                refused. The node's own view of client `shed`.
+#   3. keeps up with the chain   best/finalized/sync_target plus import and
+#                                verification time. best stalling while
+#                                sync_target climbs means it heard about blocks
+#                                and failed to import them.
+#   4. keeps finalising          grandpa_round must advance. Finality is the first
+#                                thing to suffer when serving starves the node.
+#   5. keeps its peers           peers, and conn_in_* churn.
+#
+# Plus trie cache counters, which separate "re-walked the trie" from "answered out
+# of cache": hit rate = (local_hits + shared_hits) / local_fetch_attempts over the
+# interval. Node-wide, so it cannot attribute a rate to one method — only
+# meaningful while a single operation is running.
+
+set -u
+
+HOST=${HOST:-dev-machine2}
+INTERVAL=${INTERVAL:-15}
+P2P_PORT=${P2P_PORT:-30333}
+PROM_PORT=${PROM_PORT:-9615}
+OUT_DIR=${OUT_DIR:-.}
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+PAYLOAD="$HERE/monitor-health-remote.sh"
+[ -f "$PAYLOAD" ] || { echo "missing $PAYLOAD" >&2; exit 1; }
+REMOTE_PAYLOAD=${REMOTE_PAYLOAD:-'~/monitor-health-remote.sh'}
+
+ENVS="INTERVAL=$INTERVAL P2P_PORT=$P2P_PORT PROM_PORT=$PROM_PORT"
+
+# Ship the payload and run it as a *file*. Feeding it to `bash -s` on stdin
+# instead looks like it works — exit status 0 — and silently emits nothing,
+# because the script redirects stdin internally while bash is still reading
+# itself from it. Do not "simplify" this back into a heredoc.
+sync_payload() {
+    scp -q "$PAYLOAD" "$HOST:$REMOTE_PAYLOAD" || {
+        echo "failed to copy $PAYLOAD to $HOST" >&2
+        exit 1
+    }
+}
+
+if [ "${1:-}" = "--once" ]; then
+    [ "${SKIP_SYNC:-}" = 1 ] || sync_payload
+    ssh -n "$HOST" "MODE=once $ENVS bash $REMOTE_PAYLOAD"
+    exit $?
+fi
+
+sync_payload
+
+mkdir -p "$OUT_DIR"
+OUT="$OUT_DIR/health.csv"
+SKEW=$(( $(date +%s) - $(ssh -n "$HOST" date +%s) ))
+echo "health monitor on $HOST -> $OUT (every ${INTERVAL}s, local-remote clock skew ${SKEW}s)"
+
+# exec so killing this pid tears down the ssh session, and with it the remote
+# loop (which dies on the broken pipe at its next write).
+exec ssh "$HOST" "MODE=loop $ENVS bash $REMOTE_PAYLOAD" > "$OUT"
