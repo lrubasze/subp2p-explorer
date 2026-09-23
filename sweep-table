@@ -33,7 +33,7 @@
 #   cores      CPU seconds of the *polkadot process only*, over the point's wall
 #              time — the sampler reads /proc/<polkadot pid>/stat, so the generator
 #              is NOT included even though it shares the box. Includes the node's
-#              own work (importing Kusama), which idles at ~0.47 cores here.
+#              own work (importing the chain; MEASURED ~0.47 cores idle on Kusama).
 #              This is the column that refutes the single-serial-worker model:
 #              MEASURED 5.89 cores while serving small reads at 25,254/s.
 #   cache%     trie node-cache hit rate over the point. Node-wide, so it is only

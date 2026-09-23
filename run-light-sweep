@@ -47,7 +47,9 @@ URL=${URL:-ws://127.0.0.1:9944}
 ADDRESS=${ADDRESS:-/ip4/127.0.0.1/tcp/30333}
 RATE=${RATE:-40000}
 DURATION=${DURATION:-30}
-CAMPAIGN=${CAMPAIGN:-serving-$(date +%Y-%m-%d)}
+# Chain tag in the campaign name keeps Polkadot and Kusama results apart.
+CHAIN=${CHAIN:-polkadot}
+CAMPAIGN=${CAMPAIGN:-serving-$CHAIN-$(date +%Y-%m-%d)}
 OUT_ROOT=${OUT_ROOT:-results/$CAMPAIGN/sweep}
 COOLDOWN=${COOLDOWN:-5}
 
@@ -61,10 +63,12 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 # `account_nonce` reads System::Account[random] behind a runtime call, and `sread`
 # reads the same trie path with no Wasm. Their proofs are 2425 vs 2426 bytes.
 #
-# Keys verified against the finalized head before this file was written:
-# Session::Validators is 22,400 B (700 validators x 32 B + 2 B length prefix, which
-# cross-checks against Babe::Authorities at 700 x 40 B + 2), and `:code` is
-# 1,724,631 B.
+# Keys are chain-agnostic (twox128 pallet/item hashes); the sizes are not.
+# MEASURED 2026-09-23 on the Polkadot node (state_getStorageSize at head):
+# Session::Validators 19,202 B (600 validators x 32 B + 2 B length prefix, which
+# cross-checks against Babe::Authorities at 24,002 B = 600 x 40 B + 2), and
+# `:code` 1,653,355 B. Kusama, for the 2026-09-01 campaign: 22,400 B (700
+# validators) and 1,724,631 B.
 ACCOUNT_PREFIX=26aa394eea5630e07c48ae0c9558cef7b99d880ec681799c0cf30e8886371da9
 VALIDATORS_KEY=cec5070d609dd3497f72bde07fc96ba088dcde934c658227ee1dfafcd6e16903
 
@@ -72,20 +76,20 @@ declare -A METHOD=(
     # zsh applies the :r history modifier to $VAR:rand48, so the brace is not
     # optional even though this script is bash.
     [sread]="read:${ACCOUNT_PREFIX}:rand48"   # small read,  ~2.4 kB
-    [mread]="read:${VALIDATORS_KEY}"          # mid read,    ~23.4 kB
-    [lread]="warp_code"                       # large read,  ~1.73 MB (:code)
+    [mread]="read:${VALIDATORS_KEY}"          # mid read,    ~20.2 kB (Kusama: ~23.4 kB)
+    [lread]="warp_code"                       # large read,  ~1.65 MB (:code; Kusama: ~1.73 MB)
     [qcall]="Core_version"                    # quick call,  1 B
     [mcall]="account_nonce"                   # mid call,    ~2.4 kB
-    [bcall]="babe_configuration"              # large-resp call, ~29 kB
+    [bcall]="babe_configuration"              # large-resp call, ~24 kB (Kusama: ~29 kB)
     [hcall]="Metadata_metadata"               # heavy call,  887 B, ~16.7 ms
-)
-
-# Ladders start at 1 (for serve time) and stop well short of the collapse region.
-# Prior knees: hcall at 2, mcall at ~8, mread at ~40, sread not reached by 20.
     # smoldot's per-relay-block parachain-head lookup: para_id 1000 (Asset Hub)
     # as u32 LE ++ OccupiedCoreAssumption::TimedOut (0x01), as in
     # smoldot light-base/src/sync_service/paraheads.rs.
     [pvd]="call:ParachainHost_persisted_validation_data:e803000001"
+)
+
+# Ladders start at 1 (for serve time) and stop well short of the collapse region.
+# Prior knees: hcall at 2, mcall at ~8, mread at ~40, sread not reached by 20.
 declare -A LADDER=(
     [sread]="1 2 4 8 16 24 32 48 64"
     [mread]="1 2 4 8 16 24 32 48 64"
@@ -94,11 +98,11 @@ declare -A LADDER=(
     [mcall]="1 2 4 6 8 12 16 24"
     [bcall]="1 2 4 6 8 12 16 24"
     [hcall]="1 2 3 4 6 8 12"
+    [pvd]="1 2 4 6 8 12 16 24"
 )
 
 DEFAULT_OPS="sread mread lread qcall mcall bcall hcall"
 OPS=${OPS:-$DEFAULT_OPS}
-    [pvd]="1 2 4 6 8 12 16 24"
 
 # Override the ladder for whichever ops this invocation runs. Needed when a first
 # pass ends with the peak sitting on the last rung and no shedding anywhere — that
@@ -119,7 +123,7 @@ if [ ! -f "$SUMMARY" ]; then
     echo "op,method,clients,duration_s,offered_ps,served_ps,shed_ps,ok,unserved,shed,timeout,err,aborted,p50_ms,p90_ms,p99_ms,avg_proof_b,node_ok_delta,node_fullchan_delta,node_cpu_s,rss_kb_before,rss_kb_after,cache_hit_pct" > "$SUMMARY"
 fi
 
-echo "campaign : $CAMPAIGN"
+echo "campaign : $CAMPAIGN ($CHAIN)"
 echo "target   : $HOST $ADDRESS (loopback, generator on the node)"
 echo "points   : ${DURATION}s each, --rate $RATE (closed-loop: concurrency = --clients)"
 echo "ops      : $OPS"

@@ -1,9 +1,9 @@
 #!/bin/bash
 
 #URL=ws://195.154.218.123:30334
-URL=wss://kusama-rpc.polkadot.io
+URL=wss://rpc.polkadot.io
 ADDRESS=/ip4/195.154.218.123/tcp/30333
-#/p2p/12D3KooWFiabPjp5Y5gADpEYzVtkNUKeSAUJB2QtPFMXsi6qwi1y
+#/p2p/12D3KooWHJ25vNy6EekgrGmqKt3gHuNUbZeESW26L2W2M8zCfBDR   # Polkadot load-test node
 
 #URL=wss://paseo-asset-hub-next-rpc.polkadot.io
 #ADDRESS=/dns4/paseo-asset-hub-next-collator-node-0.parity-testnet.parity.io/tcp/443/wss

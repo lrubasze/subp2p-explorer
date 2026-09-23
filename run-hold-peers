@@ -15,15 +15,17 @@
 #URL=ws://127.0.0.1:9944
 #ADDRESS=/ip4/127.0.0.1/tcp/30333
 
-URL=wss://kusama-rpc.polkadot.io
+# dev-machine2, Polkadot load-test node (PeerId 12D3KooWHJ25vNy6EekgrGmqKt3gHuNUbZeESW26L2W2M8zCfBDR)
+URL=wss://rpc.polkadot.io
 ADDRESS=/ip4/195.154.218.123/tcp/30333
 
 #URL=wss://paseo-asset-hub-next-rpc.polkadot.io
 #ADDRESS=/dns4/paseo-asset-hub-next-collator-node-0.parity-testnet.parity.io/tcp/443/wss
 
-# Set GENESIS to skip the RPC entirely. Unlike spam-light / soak-light this
-# command needs no live chain state, only the genesis hash.
-GENESIS=${GENESIS:-}
+# Unlike spam-light / soak-light this command needs no live chain state, only
+# the genesis hash, so default to it and skip the RPC. Polkadot below; Kusama is
+# 0xb0a8d493285c2df73290dfb7e61f870f17b41801197a149ca93654499ea3dafe. GENESIS= (empty) falls back to URL.
+GENESIS=${GENESIS-0x91b171bb158e2d3848fa23a9f1c25182fb8e20313b2c1eb49219da7a70ce90c3}
 
 # light hits --in-peers-light, full and authority hit --in-peers
 ROLE=${ROLE:-light}
@@ -39,12 +41,12 @@ RAMP_MS=${RAMP_MS:-10}
 # Our side only. A refused peer is dropped by the node after its own idle
 # timeout (measured: 10.0s against a dev node) regardless of this value.
 IDLE_TIMEOUT=${IDLE_TIMEOUT:-300}
-
-# Set OUT_DIR to capture one comparable dataset per run, e.g.
 # Follow /grandpa/1 like smoldot (answer neighbor packets, advance on commits),
 # so holders count as light gossip peers and load the lucky_light_peers set that
 # finality-lag measures. GRANDPA=false reproduces pre-22-Sep-2026 runs.
 GRANDPA=${GRANDPA:-true}
+
+# Set OUT_DIR to capture one comparable dataset per run, e.g.
 #
 #   OUT_DIR=results/light-500 PEERS=500 ./run-hold-peers
 #

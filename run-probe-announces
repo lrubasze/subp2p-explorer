@@ -23,7 +23,7 @@
 #URL=ws://127.0.0.1:9944
 #ADDRESS=/ip4/127.0.0.1/tcp/30333
 
-URL=wss://kusama-rpc.polkadot.io
+URL=wss://rpc.polkadot.io
 ADDRESS=/ip4/195.154.218.123/tcp/30333
 
 #URL=wss://paseo-asset-hub-next-rpc.polkadot.io
