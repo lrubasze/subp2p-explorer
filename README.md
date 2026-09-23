@@ -21,6 +21,12 @@ halves measure independent limits and have their own docs:
   `probe-announces`. These occupy the peer slots that `--in-peers-light` and
   `--in-peers` ration, and measure how announcements degrade as the peer count
   grows.
+- **Finality lag seen by light peers** —
+  [`finality-lag-examples.md`](./finality-lag-examples.md) for `finality-lag`. A
+  probe of smoldot-like peers that follow `/grandpa/1` and record when commits
+  reach them, run alongside `hold-peers` load. Reproduces
+  [smoldot#3375](https://github.com/paritytech/smoldot/issues/3375): the node
+  hands each commit to only 4 light peers per GRANDPA round.
 
 ## discover-network
 

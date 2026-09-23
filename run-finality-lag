@@ -1,0 +1,110 @@
+#!/bin/bash
+
+# Measure the finality lag light peers see from one node, and how it grows with
+# the node's light-peer count. Reproduces paritytech/smoldot#3375.
+#
+# Two processes, like probe-announces + hold-peers:
+#
+#   - the PROBE: `finality-lag`, a few light peers that follow /grandpa/1 like
+#     smoldot and record when commits reach them. Small so its timings are ours,
+#     not its own scheduling.
+#   - the LOAD (optional): `hold-peers --grandpa true`, LOAD light peers that
+#     also follow /grandpa/1, so the node's gossip validator has LOAD + PEERS
+#     light peers competing for its 4 lucky slots per round.
+#
+# Prediction (sc-consensus-grandpa gossip.rs): every GRANDPA round the node
+# offers its best commit to 4 light peers drawn at random, so a light peer is
+# picked with probability 4 / (light peers) per round and the gap between commits
+# reaching one peer, which is its finality lag, is
+#
+#     (light peers) / 4 * (round interval)
+#
+# with no cap (the 5-min periodic rebroadcast only re-sends to peers that already
+# have the commit). Rounds are ~4.1 s on both Kusama and Polkadot (Polkadot
+# MEASURED 2026-09-23: 29 rounds in 120 s via grandpa_roundState), so 120 light
+# peers -> ~2 min mean, with a tail 4-5x that.
+#
+#   ./run-finality-lag                                  # 8 probe peers, no load
+#   LOAD=120 DURATION=1200 ./run-finality-lag           # + 120 emulated smoldot peers
+#   for n in 0 16 56 120 248 504; do LOAD=$n OUT_DIR=results/flag-$((n+8)) DURATION=1200 ./run-finality-lag; done
+#
+# Serving load (run-soak-light, run-warp-sync, mix-rate) can run alongside in
+# its own shell; it does not touch the gossip path.
+#
+# With OUT_DIR set: probe output in $OUT_DIR (commits.csv, lag-samples.csv,
+# summary.txt, probe.log), load output in $OUT_DIR/load, run parameters in
+# meta.txt. `./finality-lag-table results/flag-*` tabulates the summaries.
+
+URL=${URL:-wss://rpc.polkadot.io}
+ADDRESS=${ADDRESS:-/ip4/195.154.218.123/tcp/30333}
+# Genesis only, no live state needed: default to Polkadot and skip the RPC.
+# Kusama: 0xb0a8d493285c2df73290dfb7e61f870f17b41801197a149ca93654499ea3dafe. GENESIS= (empty) falls back to URL.
+GENESIS=${GENESIS-0x91b171bb158e2d3848fa23a9f1c25182fb8e20313b2c1eb49219da7a70ce90c3}
+
+ROLE=${ROLE:-light}
+PEERS=${PEERS:-8}            # probe peers
+LOAD=${LOAD:-0}              # extra emulated smoldot peers, 0 = none
+DURATION=${DURATION:-600}    # probe hold window, seconds
+RAMP_MS=${RAMP_MS:-10}
+IDLE_TIMEOUT=${IDLE_TIMEOUT:-300}
+OUT_DIR=${OUT_DIR:-}
+# Extra seconds the load outlives the probe's window, to cover the probe's own
+# connect phase and drain.
+LOAD_MARGIN=${LOAD_MARGIN:-90}
+
+export RUST_LOG=${RUST_LOG:-info}
+
+CLI=./target/release/subp2p-explorer-cli
+if [ -n "$GENESIS" ]; then
+    CHAIN_SOURCE="--genesis $GENESIS"
+else
+    CHAIN_SOURCE="--url $URL"
+fi
+
+PROBE=("$CLI" finality-lag $CHAIN_SOURCE --address "$ADDRESS" --role "$ROLE" --peers "$PEERS"
+    --ramp-ms "$RAMP_MS" --duration "$DURATION" --idle-timeout "$IDLE_TIMEOUT")
+
+if [ -n "$OUT_DIR" ]; then
+    mkdir -p "$OUT_DIR"
+    {
+        echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "address=$ADDRESS"
+        echo "role=$ROLE probe_peers=$PEERS load_peers=$LOAD light_peers=$((PEERS + LOAD)) duration=$DURATION ramp_ms=$RAMP_MS"
+    } > "$OUT_DIR/meta.txt"
+    PROBE+=(--out-dir "$OUT_DIR")
+fi
+
+LOAD_PID=
+cleanup() {
+    [ -n "$LOAD_PID" ] && kill "$LOAD_PID" 2>/dev/null
+}
+trap cleanup EXIT
+
+if [ "$LOAD" -gt 0 ]; then
+    LOAD_LOG=${OUT_DIR:+$OUT_DIR/load/hold.log}
+    LOAD_LOG=${LOAD_LOG:-/dev/null}
+    [ -n "$OUT_DIR" ] && mkdir -p "$OUT_DIR/load"
+    echo "starting $LOAD emulated smoldot peers (hold-peers --grandpa true)..."
+    "$CLI" hold-peers $CHAIN_SOURCE --address "$ADDRESS" --role "$ROLE" --peers "$LOAD" \
+        --ramp-ms "$RAMP_MS" --duration $((DURATION + LOAD_MARGIN)) --idle-timeout "$IDLE_TIMEOUT" \
+        --grandpa true ${OUT_DIR:+--out-dir "$OUT_DIR/load"} > "$LOAD_LOG" 2>&1 &
+    LOAD_PID=$!
+    # Wait for the load to finish connecting before the probe starts, so the
+    # probe's whole window sees the full light-peer count.
+    if [ "$LOAD_LOG" != /dev/null ]; then
+        for _ in $(seq 1 $((LOAD * RAMP_MS / 1000 + 60))); do
+            grep -q "Holding for" "$LOAD_LOG" 2>/dev/null && break
+            kill -0 "$LOAD_PID" 2>/dev/null || { echo "load process died"; cat "$LOAD_LOG"; exit 1; }
+            sleep 1
+        done
+    else
+        sleep $((LOAD * RAMP_MS / 1000 + 5))
+    fi
+    echo "load connected; starting the probe"
+fi
+
+if [ -n "$OUT_DIR" ]; then
+    "${PROBE[@]}" 2>&1 | tee "$OUT_DIR/probe.log"
+else
+    "${PROBE[@]}"
+fi

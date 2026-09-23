@@ -14,6 +14,7 @@ use commands::{
     discover_peer::discover_peer,
     discovery::discover_network,
     extrinsics::submit_extrinsics,
+    finality_lag::finality_lag,
     hold_peers::{hold_peers, HoldRole},
     light_common::Chain,
     light_spam::spam_light,
@@ -37,8 +38,63 @@ enum Command {
     SpamLight(SpamLightOpts),
     SoakLight(SoakLightOpts),
     HoldPeers(HoldPeersOpts),
+    FinalityLag(FinalityLagOpts),
     ProbeAnnounces(ProbeAnnouncesOpts),
     WarpSync(WarpSyncOpts),
+}
+
+/// Measure the finality lag light peers see from one node, against how many
+/// light peers it has.
+///
+/// Each peer holds block-announces and `/grandpa/1` with the given role, joins the
+/// node's GRANDPA set with a neighbor packet, and moves its finalized head only
+/// when a commit reaches it — as smoldot does. The node sends commits to just
+/// `LUCKY_PEERS = 4` light peers per round (sc-consensus-grandpa gossip), so the
+/// gap between commits reaching one peer, and hence its finality lag, grows as
+/// N/4 times the commit interval. Reproduces paritytech/smoldot#3375.
+///
+/// The node's own neighbor packets are the reference clock, so no RPC is needed
+/// beyond fetching the genesis hash.
+#[derive(Debug, ClapParser)]
+pub struct FinalityLagOpts {
+    /// Chain preset (supplies a default p2p host and RPC url).
+    #[clap(long, short, value_enum)]
+    chain: Option<Chain>,
+    /// RPC endpoint, used only to fetch the genesis hash. Not needed if
+    /// --genesis is given.
+    #[clap(long, short)]
+    url: Option<String>,
+    /// Multiaddress of the full node to dial. Required unless --chain.
+    #[clap(long, short)]
+    address: Option<String>,
+    /// Hex-encoded genesis hash. Fetched from the RPC if omitted.
+    #[clap(long, short)]
+    genesis: Option<String>,
+    /// Role each peer advertises. Light peers are the case under test; full
+    /// peers are a control, they get commits through the sqrt(peers) stage sets.
+    #[clap(long, short, value_enum, default_value = "light")]
+    role: HoldRole,
+    /// Number of concurrent peers to open and hold.
+    #[clap(long, short, default_value = "16")]
+    peers: usize,
+    /// Gap between opening peers, in milliseconds. 0 opens them all at once.
+    #[clap(long, default_value = "10")]
+    ramp_ms: u64,
+    /// How long to hold, in seconds, timed from the moment every peer has
+    /// connected. Make it several times the expected lag (N/4 * ~6s on Kusama).
+    #[clap(long, short, value_parser = parse_duration)]
+    duration: std::time::Duration,
+    /// Grace period, in seconds, for dials to settle after the last peer was
+    /// opened.
+    #[clap(long, default_value = "30", value_parser = parse_duration)]
+    connect_timeout: std::time::Duration,
+    /// How long we keep a connection with no open substream, in seconds.
+    #[clap(long, default_value = "300", value_parser = parse_duration)]
+    idle_timeout: std::time::Duration,
+    /// Directory to write commits.csv (one row per commit delivered),
+    /// lag-samples.csv (one row per second) and summary.txt into.
+    #[clap(long)]
+    out_dir: Option<std::path::PathBuf>,
 }
 
 /// Measure block-announcement quality from a small, unloaded process.
@@ -722,6 +778,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 opts.connect_timeout,
                 opts.out_dir,
                 opts.grandpa,
+            )
+            .await
+        }
+        Command::FinalityLag(opts) => {
+            finality_lag(
+                opts.chain,
+                opts.url,
+                opts.address,
+                opts.genesis,
+                opts.role,
+                opts.peers,
+                opts.ramp_ms,
+                opts.duration,
+                opts.idle_timeout,
+                opts.connect_timeout,
+                opts.out_dir,
             )
             .await
         }

@@ -1,0 +1,28 @@
+#!/bin/bash
+
+# Tabulate finality-lag runs: one row per run directory holding summary.txt.
+#
+#   ./finality-lag-table results/flag-*
+#
+# light = probe + load peers offered (from meta.txt; the node's real light peers
+# are on top of that and unknown), T = the node's mean GRANDPA round interval,
+# pred = light/4*T, the mean gap the lucky_light_peers mechanism predicts; gapavg
+# is the measured mean gap to compare it with.
+
+printf "%-22s %6s %5s %6s | %6s %6s %6s %6s | %6s %6s %6s | %5s %5s | %s\n" \
+    run light open "T(s)" pred gapavg gap50 gap90 lag50 lag90 lagmax blk50 blkmax "deliv/commit"
+for d in "$@"; do
+    d=${d%/}
+    [ -f "$d/summary.txt" ] || continue
+    light=$(sed -n 's/.*light_peers=\([0-9]*\).*/\1/p' "$d/meta.txt" 2>/dev/null)
+    get() { sed -n "s/^$1=//p" "$d/summary.txt"; }
+    light=${light:-$(get peers)}
+    nc=$(get node_commits); cd_=$(get commits_delivered)
+    ratio=$(awk -v a="$cd_" -v b="$nc" 'BEGIN{ if (b>0) printf "%.2f", a/b; else print "-" }')
+    pred=$(awk -v n="$light" -v t="$(get round_interval_s)" 'BEGIN{ printf "%.0f", n/4*t }')
+    printf "%-22s %6s %5s %6s | %6.0f %6.0f %6.0f %6.0f | %6.0f %6.0f %6.0f | %5.0f %5.0f | %s\n" \
+        "$(basename "$d")" "$light" "$(get peers_open)" "$(get round_interval_s)" \
+        "$pred" "$(get gap_s_mean)" "$(get gap_s_p50)" "$(get gap_s_p90)" \
+        "$(get lag_s_p50)" "$(get lag_s_p90)" "$(get lag_s_max)" \
+        "$(get lag_blocks_p50)" "$(get lag_blocks_max)" "$ratio"
+done

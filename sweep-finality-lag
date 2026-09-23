@@ -1,0 +1,32 @@
+#!/bin/bash
+
+# Sweep the node's light-peer count and measure finality lag at each point.
+#
+#   ./sweep-finality-lag                       # defaults below
+#   TOTALS="8 64 256" ./sweep-finality-lag     # pick the light-peer totals
+#
+# Each point runs run-finality-lag with PEERS probe peers plus (total - PEERS)
+# emulated smoldot peers as load, into results/flag-<total>[-<TAG>]. Durations
+# scale with the expected lag (total/4 * ~4.1s round, Kusama and Polkadot alike), bounded below by MIN_DURATION and
+# above by MAX_DURATION, so each window holds several lag periods.
+
+TOTALS=${TOTALS:-"8 32 64 128 256"}
+PEERS=${PEERS:-8}
+MIN_DURATION=${MIN_DURATION:-600}
+MAX_DURATION=${MAX_DURATION:-1200}
+TAG=${TAG:-}
+RESULTS=${RESULTS:-results}
+
+for total in $TOTALS; do
+    load=$((total - PEERS))
+    [ "$load" -lt 0 ] && { echo "total $total < probe peers $PEERS, skipped"; continue; }
+    # ~6 expected gaps of total/4 * 7 s, clamped.
+    duration=$((total * 7 / 4 * 6))
+    [ "$duration" -lt "$MIN_DURATION" ] && duration=$MIN_DURATION
+    [ "$duration" -gt "$MAX_DURATION" ] && duration=$MAX_DURATION
+    out="$RESULTS/flag-$total${TAG:+-$TAG}"
+    echo "=== light peers $total (probe $PEERS + load $load), hold ${duration}s -> $out"
+    PEERS=$PEERS LOAD=$load DURATION=$duration OUT_DIR=$out ./run-finality-lag > /dev/null 2>&1
+    tail -n 12 "$out/probe.log" | tr '\r' '\n' | grep -E "^(node|delivered|gap|lag)"
+done
+./finality-lag-table "$RESULTS"/flag-*${TAG:+-$TAG}
