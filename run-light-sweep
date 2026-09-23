@@ -82,6 +82,10 @@ declare -A METHOD=(
 
 # Ladders start at 1 (for serve time) and stop well short of the collapse region.
 # Prior knees: hcall at 2, mcall at ~8, mread at ~40, sread not reached by 20.
+    # smoldot's per-relay-block parachain-head lookup: para_id 1000 (Asset Hub)
+    # as u32 LE ++ OccupiedCoreAssumption::TimedOut (0x01), as in
+    # smoldot light-base/src/sync_service/paraheads.rs.
+    [pvd]="call:ParachainHost_persisted_validation_data:e803000001"
 declare -A LADDER=(
     [sread]="1 2 4 8 16 24 32 48 64"
     [mread]="1 2 4 8 16 24 32 48 64"
@@ -94,6 +98,7 @@ declare -A LADDER=(
 
 DEFAULT_OPS="sread mread lread qcall mcall bcall hcall"
 OPS=${OPS:-$DEFAULT_OPS}
+    [pvd]="1 2 4 6 8 12 16 24"
 
 # Override the ladder for whichever ops this invocation runs. Needed when a first
 # pass ends with the peak sitting on the last rung and no shedding anywhere — that
