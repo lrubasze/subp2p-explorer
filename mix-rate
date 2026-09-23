@@ -15,11 +15,10 @@
 #
 # and the rate for a target utilisation is R = TARGET_UTIL / that sum. This is an
 # approximation in one specific way, stated here rather than buried: it assumes
-# the costs add linearly. They do not exactly — the operations have different
-# effective parallelism (MEASURED: 2.1 for the heavy call, 6.3 for a small read),
-# so a mix of cheap and expensive requests interleaves better than the sum
-# suggests. That makes the derived rate conservative, which is the right direction
-# for a soak whose point is that it holds.
+# the costs add linearly. Proof generation is serial, so handler time does add up;
+# what does not is the network-path CPU around it, which is spread over several
+# cores and differs per operation (MEASURED: ~19% of CPU is proving for a small
+# read against ~92% for the heavy call). Treat the derived rate as approximate.
 #
 # The ceiling per operation is the *peak* of its sweep curve, not the last point:
 # past the knee, throughput falls again from self-inflicted congestion collapse.

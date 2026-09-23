@@ -25,9 +25,11 @@ handling in production systems." This campaign produced that data.
 
 **"Light requests per second" is not a number.** Across the agreed request set,
 response sizes span 1 B to 1.73 MB and ceilings span 128/s to 25,254/s — 197×. Any
-answer has to name the request. And the axis that predicts cost is
-**call-vs-read**, not response size: a read and a call over the same trie path with
-proofs of 2,424 vs 2,425 B differ by **4.4×** in throughput.
+answer has to name the request. Two terms set the cost. **Wasm**: a read and a call
+over the same trie path, with proofs of 2,424 vs 2,425 B, differ by **4.4×**, which is
+instantiation and execution alone. **Bytes**: negligible low down, but dominant by
+1.73 MB, where `:code` — a plain read with no Wasm — manages 926/s, 27× slower than
+the small read. Which term dominates depends on the response size.
 
 Above that sits a second result: for everything byte-heavy, a spec node's
 **500 Mbit/s uplink runs out before the node does**, by up to 26×.
@@ -47,7 +49,8 @@ Above that sits a second result: for everything byte-heavy, a spec node's
 - `RemoteReadChildRequest` is the third message type (oneof field 4, alongside
   call=1 and read=2) and is a **read**: answered from `read_child_proof` with no
   Wasm. `storage_key` must carry the `:child_storage:default:` prefix.
-- **Capacity is not `1 / service_time` of a single serial worker.** See below.
+- **Capacity is `1 / service_time` of a single serial worker** — confirmed in the
+  source; see below for what that service time actually is per request type.
 
 ## Method
 
@@ -88,28 +91,45 @@ Per operation: proof size, serve time, knee, ceiling, effective parallelism, byt
 rate, and the share of a 500 Mbit/s uplink it consumes. Plus a long mixed run for
 sustained behaviour. All in `SCALING.md`.
 
-## What this document used to claim
+## The serial-worker model: confirmed, with one addition
 
-The original version stated that the handler "processes requests on a **single
-serial worker**", and concluded that "node capacity is essentially
-`1 / service_time` of that single worker". **The measurements do not fit that
-model**, and anyone reasoning from it will be wrong by a large factor:
+The original version of this document stated that the handler "processes requests on
+a **single serial worker**" and that "node capacity is essentially
+`1 / service_time` of that single worker". **That is correct**, VERIFIED in
+polkadot-sdk @ `0e1812505`:
 
-- MEASURED: the polkadot process burns **5.89 cores** while serving small reads at
-  25,254/s (sampler reads `/proc/<polkadot pid>/stat`, so this excludes the
-  generator; the node idles at ~0.47 cores). A single serial worker cannot exceed
-  one core.
-- CALCULATED: `ceiling × single-client serve time` — requests in flight at
-  saturation — ranges from **2.2** (`Metadata_metadata`) to **7.6** (small read).
-  A strictly serial worker would put it at ~1, and the *variation* across operations
-  is the part a serial model cannot produce at all.
+- `substrate/client/service/src/builder.rs` spawns exactly one task,
+  `spawn_handle.spawn("light-client-request-handler", ..., handler.run())`.
+- `run()` is `while let Some(request) = self.request_receiver.next().await { match
+  self.handle_request(..) }`, and `handle_request` is a **synchronous** `fn` taking
+  `&mut self` that calls `client.execution_proof(..)` / `read_proof(..)` inline.
+  No spawn, no await, so one proof at a time.
 
-So the 20-slot queue is a burst limit in front of something that serves several
-requests at once, and cheap requests interleave better than expensive ones. What is
-*not* pinned down is the mechanism — worker count is not separable from per-worker
-service time by these measurements alone.
+So `ceiling = 1 / handler service time`, and `1/ceiling` recovers that budget: 40 µs
+for a small read, 176 µs for `account_nonce`, 7.8 ms for `Metadata_metadata` — a
+195× span in front of a single shared 20-slot queue.
 
-The original per-method proof sizes and the "686 req/s" figure are also superseded.
+**The addition, which the original did not anticipate: the handler is not where most
+of the CPU goes for cheap requests.** A serial worker can use at most one core, but
+serving 25,254 small reads/s costs the process **5.4 cores** net of a 0.52-core idle
+baseline — so ~4.4 cores are the network path (per-request substream setup, response
+writes), not proving. `Metadata_metadata` is the reverse: 1.09 cores total, ~92% of it
+inside the handler.
+
+That also means these measurements cannot say *which* of the two saturates for the
+cheap request types, because the handler's own service time is not instrumented —
+and `requests_in_success_total_sum`, the metric that looks like it would tell you,
+under-reports by ~8100× on litep2p.
+
+**A correction to a previous revision of this file:** it claimed the measurements
+refuted the serial-worker model, arguing from whole-process core counts and from
+`ceiling × round-trip` being 2.2-7.6. Both were misread. Whole-process CPU includes
+the network path, and `ceiling × round-trip` is **pipeline depth** — requests sitting
+in the client, the TCP path and the queue — not concurrent proving. Little's law
+gives requests *in the system*, which legitimately exceeds 1 for a serial server fed
+by a queue.
+
+The original per-method proof sizes and the "686 req/s" figure are still superseded.
 That run offered 10 in flight against a 20-slot queue with `err`/`timeout` at zero,
 which by trap 1 above means it measured the client: `10 / 14.6 ms ≈ 686`. It was
 correctly labelled a lower bound at the time; the actual figure for that mix is

@@ -17,12 +17,19 @@
 #              concurrency that saturates. It moves with serve time, which is why
 #              one client count cannot be reused across operations.
 #   par        ceiling x serve_ms = requests in flight at saturation (Little's
-#              law). NOT constant across operations, so there is no fixed worker
-#              pool; cheap requests interleave better.
-#   MB/s       ceiling x proof size — what decides whether a real deployment hits
-#              its uplink before it hits the node.
+#              law). This is PIPELINE DEPTH, not parallelism: proof generation is
+#              serial (one `light-client-request-handler` task, synchronous
+#              `handle_request`), so those requests sit in the client, the TCP path
+#              and the 20-slot queue, and only one is ever being proved.
+#   MiB/s      ceiling x proof size, in mebibytes — what decides whether a real
+#              deployment hits its uplink before it hits the node. Note uplink%
+#              below converts to DECIMAL MB, since links are quoted in Mbit/s.
 #   shed%      at the ceiling point. Zero shed at the peak means the number is a
-#              floor, not a ceiling: the node was never pushed to refuse.
+#              floor, not a ceiling: the node was never pushed to refuse. A LARGE
+#              shed% means the opposite — the peak is a point you would not run at,
+#              so quote the knee's rate instead, and recompute par and MiB/s from
+#              it. `lread` peaks at 946/s while refusing 75%; the reportable number
+#              is the 926/s at its knee.
 #   cores      CPU seconds of the *polkadot process only*, over the point's wall
 #              time — the sampler reads /proc/<polkadot pid>/stat, so the generator
 #              is NOT included even though it shares the box. Includes the node's
@@ -72,7 +79,7 @@ NR == 1 { next }
 END {
     up_bs = uplink_mbit * 125000
     printf "%-6s %-34s %8s %5s %8s %5s %8s %6s %6s %6s %7s\n", \
-        "op", "request", "serve_ms", "knee", "ceiling", "par", "MB/s", "shed%", "cores", "cache%", "uplink%"
+        "op", "request", "serve_ms", "knee", "ceiling", "par", "MiB/s", "shed%", "cores", "cache%", "uplink%"
     for (i = 1; i <= k; i++) {
         op = order[i]
         knee = pc[op]

@@ -17,13 +17,13 @@ MEASURED 1 Sep 2026, `run-light-sweep`, 30 s per point, one operation at a time.
 Ceilings are the **peak of a concurrency curve**, and every one is bracketed by
 shedding or by a measured collapse on the far side — none is extrapolated.
 
-| op | request | proof | serve time | knee | **ceiling** | par | MB/s |
+| op | request | proof | serve time | knee | **ceiling** | par | MiB/s |
 |---|---|---|---|---|---|---|---|
-| `sread` | read `System::Account[rand48]` | 2,424 B | 0.3 ms | 48 | **25,254/s** | 7.6 | 58 |
+| `sread` | read `System::Account[rand48]` | 2,425 B | 0.3 ms | 48 | **25,254/s** | 7.6 | 58 |
 | `mread` | read `Session::Validators` | 23,399 B | 0.3 ms | 48 | **21,839/s** | 6.6 | 487 |
-| `lread` | read `:code` + `:heappages` | 1,725,396 B | 5.6 ms | 32 | **~930/s** | 5.3 | 1,557 |
+| `lread` | read `:code` + `:heappages` | 1,725,396 B | 5.6 ms | 32 | **~930/s** | 5.2 | 1,524 |
 | `qcall` | call `Core_version` | 1 B | 0.5 ms | 16 | **7,699/s** | 3.8 | 0 |
-| `mcall` | call `account_nonce` | 2,425 B | 0.6 ms | 8 | **5,683/s** | 3.4 | 13 |
+| `mcall` | call `account_nonce` | 2,424 B | 0.6 ms | 8 | **5,683/s** | 3.4 | 13 |
 | `bcall` | call `babe_configuration` | 29,374 B | 0.7 ms | 6 | **4,008/s** | 2.8 | 112 |
 | `hcall` | call `Metadata_metadata` | 887 B | 16.8 ms | 2 | **128/s** | 2.2 | 0.1 |
 | — | `/sync/warp` proof | 8,373,366 B | 79 ms | 20 † | **26.6/s** | 2.1 | 213 |
@@ -31,24 +31,45 @@ shedding or by a measured collapse on the far side — none is extrapolated.
 † The warp row is carried over from the earlier campaign, not re-measured here; 20
 is the concurrency at which it was saturated, not a swept knee.
 
-`par = ceiling × serve time` — requests in flight at saturation. It is **not
-constant** (2.2 → 7.6), so there is no fixed worker pool: cheap requests interleave
-better. Serve time is read at **one** client; past the knee `send->resp` is
-queueing, not service.
+**Proof generation is serial** — `builder.rs` spawns one `light-client-request-handler`
+task whose loop calls a synchronous `handle_request` with `execution_proof`/`read_proof`
+inline (VERIFIED in polkadot-sdk @ `0e1812505`). So `ceiling = 1 / handler service
+time`, and `1/ceiling` gives the budget that worker must be hitting: 40 µs for a small
+read, 7.8 ms for `Metadata_metadata` — a 195× span.
+
+`par = ceiling × serve time` is therefore **pipeline depth, not parallelism**: those
+2.2-7.6 requests sit in the client, the TCP path and the 20-slot queue, and only one is
+ever being proved. Serve time is read at **one** client, and it is a round trip, not the
+handler's service time — for a small read it is 0.3 ms against a ~40 µs handler budget,
+the rest being client, loopback and per-request substream setup.
 
 Three findings the table encodes:
 
-**Call vs read is the axis that matters, not size.** `mcall` and `sread` touch the
-same trie path and return proofs of 2,425 vs 2,424 B — bytes and path held constant,
-the only difference is Wasm. The read serves **4.4× more** (25,254 vs 5,683/s), and
-Wasm costs ~0.3 ms of serve time *and* halves effective parallelism (3.4 vs 7.6).
-Never rank calls by response size: for a runtime call the response is the execution
-proof, so a call can burn milliseconds and return 887 bytes.
+**Two cost terms, Wasm and bytes, and which dominates depends on the size.** They
+are separable, and each has a controlled measurement behind it.
 
-**Bytes are nearly free below ~1 MB.** `sread` → `mread` is **10× the bytes for
-13.5% of the throughput** (25,254 → 21,839/s). The bottleneck is the trie walk and
-per-request overhead. Bytes only take over much higher: `lread` at 1.73 MB tops out
-at ~930/s, so the crossover sits between 23 kB and 1.73 MB and is still unmeasured.
+**What a call adds is Wasm instantiation and execution: ~136 us.** `mcall` and
+`sread` touch the same trie path and return proofs of 2,424 vs 2,425 B — bytes and
+path held constant, the only difference is execution. The read serves **4.4× more**
+(25,254 vs 5,683/s), i.e. 176 us against 40 us of the serial handler's time. Never
+rank calls by response size: for a runtime call the response is the execution proof,
+so a call can burn milliseconds and return 887 bytes.
+
+**Bytes are free until they aren't.** `sread` → `mread` is **10× the bytes for
+13.5% of the throughput** (25,254 → 21,839/s) — at that size the bottleneck is the
+trie walk and per-request overhead. But `lread` is a plain read with **no Wasm at
+all** and manages only ~930/s, **27× slower than `sread`**, purely on 1.73 MB. So
+above some size bytes dominate and execution is irrelevant, the reverse of the pair
+above. MEASURED, the crossover is somewhere in the 23 kB–1.73 MB gap and nothing was
+run inside it; CALCULATED, the byte term equals the ~39 us fixed per-request cost at
+**64–132 kB**.
+
+CALCULATED, and the reason this is not one linear trend: marginal cost is
+**0.295 ns/B** over `sread`→`mread` but **0.608 ns/B** over `mread`→`lread`. Fitting
+`t = 38.9 us + 0.295 ns/B` on the two small reads predicts **1,824/s** for `lread`
+against 926/s measured — extrapolating byte cost from small reads **over-states large
+read capacity by ~2×**. Caveat: three points only, and `lread` is the point most
+exposed to generator co-tenancy.
 
 **The heavy call is the outlier by two orders of magnitude.** `Metadata_metadata` is
 128/s against 4,008/s for `babe_configuration` — same shape of work, 31× apart —
@@ -75,7 +96,7 @@ from an unfinished ladder. Extending it found the peak at 32–48 clients:
 | served/s | 790 | 851 | **926** | 946 | 672 |
 | shed | 0 | 0 | 3,311 | 85,696 | 21,279 |
 
-Quote **~930/s** (32 clients, 0.4% shed), not the 946 at 48 where three quarters of
+Quote **~930/s** (32 clients, 10.6% shed), not the 946 at 48 where three quarters of
 offered requests are refused. Beyond 48 it collapses to 672/s.
 
 **It is the node's limit, not ours.** Two generator processes at 24 clients each
@@ -87,15 +108,18 @@ lower bound on what a node with the box to itself would serve.
 
 ## What the uplink allows — the number that actually matters
 
-Node ceilings are mostly unreachable in the field. Against the
+Node ceilings are mostly unreachable in the field. "Uplink" here means the node's
+provisioned bandwidth to the internet, which is what the
 [reference spec](https://docs.polkadot.com/node-infrastructure/run-a-validator/requirements/)
-uplink of **500 Mbit/s** (62.5 MB/s):
+sets at **500 Mbit/s** (62.5 MB/s) — **not** the network interface, which on this box
+is 10 GbE. Serving is almost pure egress: requests are a few hundred bytes, responses
+up to 8.4 MB. So against 500 Mbit/s:
 
 | op | node ceiling | 500 Mbit/s allows | reachable |
 |---|---|---|---|
 | `qcall` / `hcall` | 7,699/s / 128/s | not byte-limited | **100%** |
-| `mcall` | 5,683/s | 25,773/s | **100%** |
-| `sread` | 25,254/s | 25,783/s | **98%** |
+| `mcall` | 5,683/s | 25,784/s | **100%** |
+| `sread` | 25,254/s | 25,773/s | **98%** |
 | `bcall` | 4,008/s | 2,128/s | **53%** |
 | `mread` | 21,839/s | 2,671/s | **12%** |
 | `/sync/warp` | 26.6/s | 7.5/s | **28%** |
