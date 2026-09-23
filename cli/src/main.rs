@@ -138,6 +138,12 @@ pub struct HoldPeersOpts {
     /// announcement). Created if missing.
     #[clap(long)]
     out_dir: Option<std::path::PathBuf>,
+    /// Also open `/grandpa/1` and follow it like smoldot: answer the node's
+    /// neighbor packet, advance the finalized height on commits. This is what
+    /// makes a holder count as a light gossip peer on the node. Set to false to
+    /// reproduce runs from before 22 Sep 2026, which refused the substream.
+    #[clap(long, default_value = "true", action = clap::ArgAction::Set)]
+    grandpa: bool,
 }
 
 /// Impersonate warp-syncing clients against one full node, to load-test its
@@ -715,6 +721,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 opts.idle_timeout,
                 opts.connect_timeout,
                 opts.out_dir,
+                opts.grandpa,
             )
             .await
         }

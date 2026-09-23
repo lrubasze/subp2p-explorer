@@ -117,6 +117,7 @@ pub async fn probe_announces(
     let data = ProtocolsData {
         genesis_hash: H256::from_slice(hex::decode(&genesis)?.as_slice()),
         node_role: role.protocol_role(),
+        grandpa: false,
     };
 
     println!("Address:    {address}");

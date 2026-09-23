@@ -91,6 +91,25 @@ pub struct ProtocolsData {
     /// Note that `LightClients` will not receive any notifications on the transaction protocol
     /// to avoid resource consumption.
     pub node_role: ProtocolRole,
+
+    /// Also register `/{genesis}/grandpa/1`, on [`crate::GRANDPA_INDEX`].
+    ///
+    /// Substrate opens this substream towards every peer that holds a
+    /// block-announces slot, and on it sends neighbor packets and (to a lucky
+    /// few light peers per round) commit messages. Opt-in, so callers that only
+    /// want to occupy a slot keep refusing it as before.
+    pub grandpa: bool,
+}
+
+impl ProtocolsData {
+    /// Number of notification protocols the handler registers for this data.
+    pub fn protocol_count(&self) -> usize {
+        if self.grandpa {
+            3
+        } else {
+            2
+        }
+    }
 }
 
 /// Handles the notifications protocols.
@@ -223,8 +242,7 @@ impl NetworkBehaviour for Notifications {
                         hash
                     });
 
-                // Currently supports 2 protocols.
-                for index in 0..2 {
+                for index in 0..self.data.protocol_count() {
                     self.propagate_event(ToSwarm::NotifyHandler {
                         peer_id,
                         handler: NotifyHandler::One(connection_id),
@@ -260,8 +278,7 @@ impl NetworkBehaviour for Notifications {
                     );
                 }
 
-                // Currently supports 2 protocols.
-                for index in 0..2 {
+                for index in 0..self.data.protocol_count() {
                     self.propagate_event(ToSwarm::NotifyHandler {
                         peer_id,
                         handler: NotifyHandler::One(connection_id),

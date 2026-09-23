@@ -107,6 +107,7 @@ pub async fn build_swarm(
     let protocol_data = ProtocolsData {
         genesis_hash: H256::from_slice(hex::decode(genesis)?.as_slice()),
         node_role: ProtocolRole::FullNode,
+        grandpa: false,
     };
 
     let discovery = DiscoveryBuilder::new()

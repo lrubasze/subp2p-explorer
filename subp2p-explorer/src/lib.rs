@@ -27,3 +27,5 @@ pub struct Behaviour {
 pub const BLOCK_ANNOUNCES_INDEX: usize = 0;
 /// Protocol index for transactions.
 pub const TRANSACTIONS_INDEX: usize = 1;
+/// Only registered when [`notifications::behavior::ProtocolsData::grandpa`] is set.
+pub const GRANDPA_INDEX: usize = 2;

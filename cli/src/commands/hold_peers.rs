@@ -17,12 +17,20 @@
 //! An open notification substream is enough to keep the connection alive, so the
 //! holder only has to stay polled and drop whatever the node announces to it.
 //!
+//! With `grandpa` on (the default) a holder also behaves like smoldot on the
+//! `/grandpa/1` substream — see [`crate::commands::grandpa_follow`] — so it counts
+//! as a light gossip peer on the node and competes for the four `lucky_light_peers`
+//! slots that commits go to. That is what makes a large hold-peers run the right
+//! background load for `finality-lag`. Runs before 22 Sep 2026 refused the
+//! substream and did not load that mechanism.
+//!
 //! The headline number is how many peers were *held* versus how many were
 //! offered. Held is counted on the block-announces substream alone: the node
 //! refuses that substream without closing the connection, so counting
 //! connections would report peers we do not actually have.
 
 use crate::commands::authorities::fetch_genesis_hash;
+use crate::commands::grandpa_follow::{GrandpaFollower, GrandpaMessage};
 use crate::commands::light_common::{percentile_ms, Chain};
 use codec::{Compact, Decode};
 use futures::{future::join_all, FutureExt, StreamExt};
@@ -43,7 +51,7 @@ use subp2p_explorer::{
         behavior::{Notifications, NotificationsToSwarm, ProtocolsData},
         messages::ProtocolRole,
     },
-    BLOCK_ANNOUNCES_INDEX,
+    BLOCK_ANNOUNCES_INDEX, GRANDPA_INDEX,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant as TokioInstant;
@@ -92,6 +100,12 @@ pub(crate) struct HoldMetrics {
     evicted: AtomicU64,
     /// Block announcements received and dropped.
     pub announces: AtomicU64,
+    /// Holders currently holding the grandpa substream.
+    pub grandpa_open: AtomicU64,
+    /// Grandpa commits received across all holders (only lucky ones get them).
+    pub commits: AtomicU64,
+    /// Grandpa neighbor packets received across all holders.
+    pub neighbors: AtomicU64,
 }
 
 /// One block announcement as seen by one holder.
@@ -355,6 +369,7 @@ pub(crate) async fn run_peer(
     // once however this holder ends.
     let mut holding = false;
     let mut time_to_hold = None;
+    let mut grandpa = GrandpaFollower::default();
 
     loop {
         if *stop.borrow() {
@@ -380,14 +395,16 @@ pub(crate) async fn run_peer(
                     }
                     break;
                 }
-                SwarmEvent::Behaviour(NotificationsToSwarm::CustomProtocolOpen { index, .. })
-                    if index == BLOCK_ANNOUNCES_INDEX =>
-                {
-                    metrics.accepted.fetch_add(1, Ordering::Relaxed);
-                    if !holding {
-                        holding = true;
-                        metrics.bump_held();
-                        time_to_hold.get_or_insert(dialed_at.elapsed().as_micros() as u64);
+                SwarmEvent::Behaviour(NotificationsToSwarm::CustomProtocolOpen { index, sender, .. }) => {
+                    if index == BLOCK_ANNOUNCES_INDEX {
+                        metrics.accepted.fetch_add(1, Ordering::Relaxed);
+                        if !holding {
+                            holding = true;
+                            metrics.bump_held();
+                            time_to_hold.get_or_insert(dialed_at.elapsed().as_micros() as u64);
+                        }
+                    } else if index == GRANDPA_INDEX && grandpa.on_open(sender) {
+                        metrics.grandpa_open.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 SwarmEvent::Behaviour(NotificationsToSwarm::CustomProtocolRefused { index, .. })
@@ -396,13 +413,15 @@ pub(crate) async fn run_peer(
                     log::debug!("peer {id}: block-announces refused");
                     metrics.refused.fetch_add(1, Ordering::Relaxed);
                 }
-                SwarmEvent::Behaviour(NotificationsToSwarm::CustomProtocolClosed { index, .. })
-                    if index == BLOCK_ANNOUNCES_INDEX =>
-                {
-                    if holding {
-                        holding = false;
-                        metrics.held.fetch_sub(1, Ordering::Relaxed);
-                        metrics.evicted.fetch_add(1, Ordering::Relaxed);
+                SwarmEvent::Behaviour(NotificationsToSwarm::CustomProtocolClosed { index, .. }) => {
+                    if index == BLOCK_ANNOUNCES_INDEX {
+                        if holding {
+                            holding = false;
+                            metrics.held.fetch_sub(1, Ordering::Relaxed);
+                            metrics.evicted.fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else if index == GRANDPA_INDEX && grandpa.on_close() {
+                        metrics.grandpa_open.fetch_sub(1, Ordering::Relaxed);
                     }
                 }
                 SwarmEvent::Behaviour(NotificationsToSwarm::Notification { index, message, .. })
@@ -418,6 +437,22 @@ pub(crate) async fn run_peer(
                         held: metrics.held.load(Ordering::Relaxed),
                     });
                 }
+                SwarmEvent::Behaviour(NotificationsToSwarm::Notification { index, message, .. })
+                    if index == GRANDPA_INDEX =>
+                {
+                    // Follow like smoldot: answer the node's view, advance on
+                    // commits. Nothing is recorded per block here; that is
+                    // `finality-lag`'s job, from its own small process.
+                    match grandpa.on_notification(&message) {
+                        GrandpaMessage::Neighbor(_) => {
+                            metrics.neighbors.fetch_add(1, Ordering::Relaxed);
+                        }
+                        GrandpaMessage::Commit { .. } => {
+                            metrics.commits.fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => {}
+                    }
+                }
                 _ => {}
             },
             // The orchestrator reads the held count before setting this, so a
@@ -431,19 +466,24 @@ pub(crate) async fn run_peer(
     if holding {
         metrics.held.fetch_sub(1, Ordering::Relaxed);
     }
+    if grandpa.is_open() {
+        metrics.grandpa_open.fetch_sub(1, Ordering::Relaxed);
+    }
 
     time_to_hold
 }
 
 fn print_progress(metrics: &HoldMetrics, phase: &str, elapsed: f64, opened: usize, peers: usize) {
     print!(
-        "\r  [{phase}] t={elapsed:.0}s offered={opened}/{peers} connected={} held={}(peak {}) refused={} evicted={} announces={}   ",
+        "\r  [{phase}] t={elapsed:.0}s offered={opened}/{peers} connected={} held={}(peak {}) refused={} evicted={} announces={} grandpa={} commits={}   ",
         metrics.connected.load(Ordering::Relaxed),
         metrics.held.load(Ordering::Relaxed),
         metrics.peak_held.load(Ordering::Relaxed),
         metrics.refused.load(Ordering::Relaxed),
         metrics.evicted.load(Ordering::Relaxed),
         metrics.announces.load(Ordering::Relaxed),
+        metrics.grandpa_open.load(Ordering::Relaxed),
+        metrics.commits.load(Ordering::Relaxed),
     );
     let _ = std::io::Write::flush(&mut std::io::stdout());
 }
@@ -486,6 +526,12 @@ fn print_report(
         metrics.refused.load(Ordering::Relaxed),
         metrics.evicted.load(Ordering::Relaxed),
         metrics.dial_failed.load(Ordering::Relaxed),
+    );
+    println!(
+        "grandpa:    {} substreams open at the end; {} commits and {} neighbor packets received in total",
+        metrics.grandpa_open.load(Ordering::Relaxed),
+        metrics.commits.load(Ordering::Relaxed),
+        metrics.neighbors.load(Ordering::Relaxed),
     );
     println!(
         "dial->held ms: p50={:.1} p90={:.1} p99={:.1} (over {} accepted peers)",
@@ -611,6 +657,7 @@ pub async fn hold_peers(
     idle_timeout: Duration,
     connect_timeout: Duration,
     out_dir: Option<PathBuf>,
+    grandpa: bool,
 ) -> Result<(), Box<dyn Error>> {
     let peers = peers.max(1);
 
@@ -644,10 +691,15 @@ pub async fn hold_peers(
     let data = ProtocolsData {
         genesis_hash: H256::from_slice(hex::decode(&genesis)?.as_slice()),
         node_role: role.protocol_role(),
+        grandpa,
     };
 
     println!("Address:    {address}");
-    println!("Protocol:   /{genesis}/block-announces/1");
+    if grandpa {
+        println!("Protocols:  /{genesis}/block-announces/1 + /{genesis}/grandpa/1 (following commits like smoldot)");
+    } else {
+        println!("Protocol:   /{genesis}/block-announces/1");
+    }
     println!(
         "Role:       {:?} (handshake byte {})",
         role,

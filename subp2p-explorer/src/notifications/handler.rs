@@ -160,7 +160,7 @@ impl NotificationsHandler {
         let blocks = format!("/{}/block-announces/1", genesis_string);
 
         // Note:
-        // `../grandpa/1` and `../statement/1` are currently not registered.
+        // `../grandpa/1` is registered only on request (index 2); `../statement/1` is not.
 
         // The transaction protocol substream will broadcast a vector of extrinsics that is scale-encoded.
         let tx = format!("/{}/transactions/1", genesis_string);
@@ -168,7 +168,7 @@ impl NotificationsHandler {
         let block_announces =
             BlockAnnouncesHandshake::from_genesis_with_role(data.genesis_hash, &data.node_role);
 
-        let protocols = vec![
+        let mut protocols = vec![
             ProtocolDetails {
                 name: blocks.clone(),
                 handshake: block_announces.encode(),
@@ -189,6 +189,21 @@ impl NotificationsHandler {
                 },
             },
         ];
+
+        if data.grandpa {
+            // GRANDPA gossip. Like transactions, the handshake is the bare role byte;
+            // substrate derives `ObservedRole` from it, and that role decides which
+            // of the gossip validator's peer sets we can land in.
+            let grandpa = format!("/{}/grandpa/1", genesis_string);
+            protocols.push(ProtocolDetails {
+                name: grandpa.clone(),
+                handshake: vec![data.node_role.encoded()],
+                upgrade: HandshakeInbound { name: grandpa },
+                state: State::Closed {
+                    pending_opening: false,
+                },
+            });
+        }
 
         NotificationsHandler {
             peer,
