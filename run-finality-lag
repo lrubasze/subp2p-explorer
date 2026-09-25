@@ -33,7 +33,10 @@
 #
 # With OUT_DIR set: probe output in $OUT_DIR (commits.csv, lag-samples.csv,
 # summary.txt, probe.log), load output in $OUT_DIR/load, run parameters in
-# meta.txt. `./finality-lag-table results/flag-*` tabulates the summaries.
+# meta.txt, and the node-side samples in node.csv (run-monitor-node, started
+# here and stopped when the run ends; its HOST / INTERVAL pass through).
+# `./finality-lag-table results/flag-*` tabulates the probe summaries,
+# `./node-summary results/flag-*` the node side (CPU, RSS, network, drift).
 
 URL=${URL:-wss://rpc.polkadot.io}
 ADDRESS=${ADDRESS:-/ip4/195.154.218.123/tcp/30333}
@@ -70,15 +73,25 @@ if [ -n "$OUT_DIR" ]; then
         echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         echo "address=$ADDRESS"
         echo "role=$ROLE probe_peers=$PEERS load_peers=$LOAD light_peers=$((PEERS + LOAD)) duration=$DURATION ramp_ms=$RAMP_MS"
+        # Names the chain-drift timestamp cache, so runs against different
+        # chains never share one (block numbers overlap across chains).
+        echo "chain=${GENESIS:+$(echo "$GENESIS" | sed 's/^0x//' | cut -c1-8)}"
     } > "$OUT_DIR/meta.txt"
     PROBE+=(--out-dir "$OUT_DIR")
 fi
 
 LOAD_PID=
+MONITOR_PID=
 cleanup() {
     [ -n "$LOAD_PID" ] && kill "$LOAD_PID" 2>/dev/null
+    [ -n "$MONITOR_PID" ] && kill "$MONITOR_PID" 2>/dev/null
 }
 trap cleanup EXIT
+
+if [ -n "$OUT_DIR" ] && [ "${MONITOR:-1}" != 0 ]; then
+    OUT_DIR="$OUT_DIR" ./run-monitor-node &
+    MONITOR_PID=$!
+fi
 
 if [ "$LOAD" -gt 0 ]; then
     LOAD_LOG=${OUT_DIR:+$OUT_DIR/load/hold.log}

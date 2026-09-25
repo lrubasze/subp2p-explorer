@@ -4,7 +4,8 @@
 #
 # One ssh session streams samples back, one row per INTERVAL seconds:
 #
-#   epoch_ms,cpu_pct,rss_kb,fds,conns,peers_count,best,finalized,sync_target
+#   epoch_ms,cpu_pct,rss_kb,fds,conns,peers_count,best,finalized,sync_target,
+#   net_rx_bytes,net_tx_bytes,p2p_in_bytes,p2p_out_bytes,grandpa_out_bytes,grandpa_out_msgs,announce_out_bytes
 #
 # - cpu_pct/rss_kb/fds come from /proc of the polkadot process (cpu_pct is
 #   percent of one core over the sampling interval, so it can exceed 100)
@@ -15,6 +16,12 @@
 # - sync_target is the highest block the node knows its peers have. If best
 #   stalls while sync_target keeps climbing, the node heard about new blocks and
 #   failed to import them; if both stall, it never heard about them at all.
+# - net_rx/net_tx are the host's default interface counters (/proc/net/dev),
+#   cumulative bytes; p2p_in/out are the node's own libp2p byte counters;
+#   grandpa_out/announce_out are the node's notification bytes sent on the
+#   /grandpa/1 and /block-announces/1 protocols (cumulative, plus a message
+#   count for grandpa so commit size can be derived). Take deltas over a window;
+#   `node-summary` does.
 #
 # Rows are stamped with the REMOTE clock, same as the node's own view; the local
 # offset is printed at start so series from both machines can be aligned.
@@ -38,15 +45,17 @@ echo "monitoring polkadot on $HOST -> $OUT (every ${INTERVAL}s, local-remote clo
 
 # exec so that killing this script's pid kills the ssh session (and with it the
 # remote sampling loop, which dies on the broken pipe at its next write).
-exec ssh "$HOST" "INTERVAL=$INTERVAL P2P_PORT=$P2P_PORT PROM_PORT=$PROM_PORT bash -s" > "$OUT" <<'EOF'
+exec ssh "$HOST" "INTERVAL=$INTERVAL P2P_PORT=$P2P_PORT PROM_PORT=$PROM_PORT IFACE=${IFACE:-} bash -s" > "$OUT" <<'EOF'
 PID=$(pgrep -x polkadot | head -1)
 if [ -z "$PID" ]; then
     echo "polkadot is not running" >&2
     exit 1
 fi
 CLK=$(getconf CLK_TCK)
+# The interface carrying the default route, unless IFACE says otherwise.
+IFACE=${IFACE:-$(ip route get 1.1.1.1 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1) }')}
 
-echo "epoch_ms,cpu_pct,rss_kb,fds,conns,peers_count,best,finalized,sync_target"
+echo "epoch_ms,cpu_pct,rss_kb,fds,conns,peers_count,best,finalized,sync_target,net_rx_bytes,net_tx_bytes,p2p_in_bytes,p2p_out_bytes,grandpa_out_bytes,grandpa_out_msgs,announce_out_bytes"
 
 prev_cpu=0
 prev_ms=0
@@ -74,8 +83,14 @@ while kill -0 "$PID" 2>/dev/null; do
     best=$(echo "$prom" | awk '$1 ~ /^substrate_block_height{status="best"/ { print $2 }')
     finalized=$(echo "$prom" | awk '$1 ~ /^substrate_block_height{status="finalized"/ { print $2 }')
     target=$(echo "$prom" | awk '$1 ~ /^substrate_block_height{status="sync_target"/ { print $2 }')
+    p2p_in=$(echo "$prom" | awk '$1 ~ /^substrate_sub_libp2p_network_bytes_total{direction="in"/ { print $2 }')
+    p2p_out=$(echo "$prom" | awk '$1 ~ /^substrate_sub_libp2p_network_bytes_total{direction="out"/ { print $2 }')
+    grandpa_out=$(echo "$prom" | awk '$1 ~ /^substrate_sub_libp2p_notifications_sizes_sum{direction="out",protocol="[^"]*\/grandpa\/1"/ { print $2 }')
+    grandpa_msgs=$(echo "$prom" | awk '$1 ~ /^substrate_sub_libp2p_notifications_sizes_count{direction="out",protocol="[^"]*\/grandpa\/1"/ { print $2 }')
+    announce_out=$(echo "$prom" | awk '$1 ~ /^substrate_sub_libp2p_notifications_sizes_sum{direction="out",protocol="[^"]*\/block-announces\/1"/ { print $2 }')
+    read -r net_rx net_tx < <(awk -v ifc="$IFACE:" '$1 == ifc { print $2, $10 }' /proc/net/dev)
 
-    echo "$now_ms,$cpu,$rss,$fds,$conns,$peers,$best,$finalized,$target"
+    echo "$now_ms,$cpu,$rss,$fds,$conns,$peers,$best,$finalized,$target,$net_rx,$net_tx,$p2p_in,$p2p_out,$grandpa_out,$grandpa_msgs,$announce_out"
     sleep "$INTERVAL"
 done
 EOF

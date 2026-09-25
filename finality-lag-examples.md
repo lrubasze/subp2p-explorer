@@ -107,7 +107,7 @@ health     ok: every peer held both substreams and received commits
   (several validators' commits imported before the node's view moved), a
   pre-existing 5-13% overhead.
 - **commit** is the cost side: node egress to light peers is peers × kB/s.
-- For the stock node, compare gap with the lucky-set prediction
+- For a master (unpatched) node, compare gap with the lucky-set prediction
   `light peers / 4 × round interval` (the `pred` column of `finality-lag-table`).
 - **health** lists anything off (refusals, peers without commits, peers more
   than 5.5 min behind, unexpected message types), or says ok.

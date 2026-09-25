@@ -1,0 +1,46 @@
+#!/bin/bash
+
+# Node-side summary of one or more runs, from node.csv (run-monitor-node):
+#
+#   ./node-summary results/rot-baseline results/flag-*-rot
+#
+# One row per run: window, node CPU (mean % of one core), RSS at start and the
+# change over the window, mean peer count, host network rx/tx and the
+# node's /grandpa/1 and /block-announces/1 notification egress, all as rates
+# over the window, plus chain drift (from chain.txt, computed by chain-drift if
+# missing — needs ssh to the node's host). "light" is the light-peer total from
+# meta.txt when present.
+#
+# Only the rate columns need the extended node.csv (Sep 2026 onwards); older
+# runs show "-" there. The chain-drift timestamp cache is chosen per chain via
+# meta.txt's `chain=` so Kusama and Polkadot runs never mix; runs without it use
+# the original cache (Kusama).
+
+RESULTS=${RESULTS:-results}
+
+printf "%-20s %6s %6s | %6s %8s %7s | %5s | %8s %8s | %9s %9s %9s | %7s\n" \
+    run light "win s" "cpu %" "rss0 MB" "dRSS MB" peers "rx MB/s" "tx MB/s" "gpa kB/s" "gpa msg/s" "ann kB/s" "drift s"
+for d in "$@"; do
+    d=${d%/}
+    [ -f "$d/node.csv" ] || continue
+    light=$(sed -n 's/.*light_peers=\([0-9]*\).*/\1/p' "$d/meta.txt" 2>/dev/null)
+    chain=$(sed -n 's/^chain=//p' "$d/meta.txt" 2>/dev/null)
+    if [ ! -f "$d/chain.txt" ]; then
+        CACHE=${CACHE:-$RESULTS/.chain-ts${chain:+-$chain}} ./chain-drift "$d" > /dev/null 2>&1
+    fi
+    drift=$(sed -n 's/^drift_s=//p' "$d/chain.txt" 2>/dev/null)
+    awk -F, -v run="$(basename "$d")" -v light="${light:--}" -v drift="${drift:--}" '
+        NR == 1 { next }
+        NR == 2 { t0 = $1; rss0 = $3; rx0 = $10; tx0 = $11; g0 = $14; gm0 = $15; a0 = $16 }
+        { tN = $1; rssN = $3; rxN = $10; txN = $11; gN = $14; gmN = $15; aN = $16
+          if ($2 != "") { cpu += $2; n++ }
+          if ($6 != "") { peers += $6; np++ } }
+        function r(a, b, div) { return (a == "" || b == "") ? "-" : sprintf("%.2f", (b - a) / win / div) }
+        END {
+            win = (tN - t0) / 1000
+            if (win <= 0) exit
+            printf "%-20s %6s %6.0f | %6.0f %8.0f %+7.0f | %5.0f | %8s %8s | %9s %9s %9s | %7s\n",
+                run, light, win, (n ? cpu / n : 0), rss0 / 1024, (rssN - rss0) / 1024, (np ? peers / np : 0),
+                r(rx0, rxN, 1e6), r(tx0, txN, 1e6), r(g0, gN, 1e3), r(gm0, gmN, 1), r(a0, aN, 1e3), drift
+        }' "$d/node.csv"
+done
