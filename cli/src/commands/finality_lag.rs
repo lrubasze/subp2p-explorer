@@ -142,6 +142,10 @@ struct PeerState {
     commits: u64,
     /// Commits that reached this holder inside the hold window.
     commits_in_hold: u64,
+    /// The (set, round) of the last commit delivered, to spot repeats.
+    last_round: Option<(u64, u64)>,
+    /// Further copies of a commit for a round this holder already had.
+    duplicates: u64,
     /// Gaps between consecutive commits reaching this holder, hold window only.
     gaps: Vec<Duration>,
 }
@@ -174,6 +178,9 @@ pub(crate) struct Summary {
     peers_open_at_end: usize,
     peers_with_commit: usize,
     commits_delivered: u64,
+    /// Deliveries that repeated a (set, round) the peer already had — several
+    /// validators' copies of one commit, all forwarded by the node.
+    duplicates: u64,
     gap_s: Percentiles,
     lag_s: Percentiles,
     lag_blocks: Percentiles,
@@ -300,7 +307,11 @@ impl Collector {
                 state.commits += 1;
                 if in_hold {
                     state.commits_in_hold += 1;
+                    if state.last_round == Some((set_id, round)) {
+                        state.duplicates += 1;
+                    }
                 }
+                state.last_round = Some((set_id, round));
                 let prev = state.finalized;
                 if let Some((prev_height, prev_at)) = prev {
                     if in_hold && target > prev_height {
@@ -440,6 +451,7 @@ impl Collector {
                 .unwrap_or_else(|| self.peers.iter().filter(|p| p.grandpa_open).count()),
             peers_with_commit: self.peers.iter().filter(|p| p.commits > 0).count(),
             commits_delivered: self.peers.iter().map(|p| p.commits_in_hold).sum(),
+            duplicates: self.peers.iter().map(|p| p.duplicates).sum(),
             gap_s: percentiles(&mut gaps),
             lag_s: percentiles(&mut self.lag_s),
             lag_blocks: percentiles(&mut self.lag_blocks),
@@ -621,6 +633,7 @@ fn write_summary(
     writeln!(file, "node_rounds={}", s.node_rounds)?;
     writeln!(file, "round_interval_s={:.2}", s.round_interval_s)?;
     writeln!(file, "commits_delivered={}", s.commits_delivered)?;
+    writeln!(file, "duplicates={}", s.duplicates)?;
     writeln!(file, "predicted_gap_s={predicted:.1}")?;
     for (name, p) in [
         ("gap_s", s.gap_s),
@@ -648,73 +661,94 @@ fn print_report(
     metrics: &Metrics,
     s: &Summary,
 ) {
-    println!("\n=== finality-lag summary ===");
+    let open = s.peers_open_at_end;
+    let per_commit = if s.node_commits > 0 {
+        s.commits_delivered as f64 / s.node_commits as f64
+    } else {
+        0.0
+    };
+    let per_round = if s.node_rounds > 0 {
+        s.commits_delivered as f64 / s.node_rounds as f64
+    } else {
+        0.0
+    };
+    let dup_pct = if s.commits_delivered > 0 {
+        100.0 * s.duplicates as f64 / s.commits_delivered as f64
+    } else {
+        0.0
+    };
+    let kb_per_s = if s.commit_interval_s > 0.0 {
+        s.commit_bytes.mean / s.commit_interval_s / 1000.0
+    } else {
+        0.0
+    };
+
+    println!("\n=== finality-lag: {open} {role:?} peers, {hold_secs:.0} s ===");
     println!(
-        "peers:      {peers} offered as {role:?}; {held_at_end} held block-announces and {} grandpa at the end; refused {} / {} (a grandpa refusal is our early open, before the node had granted the slot; the node then opens it to us)",
-        s.peers_open_at_end,
-        metrics.refused.load(Ordering::Relaxed),
-        metrics.grandpa_refused.load(Ordering::Relaxed),
-    );
-    println!("hold:       {hold_secs:.0}s window, timed from the end of connect");
-    println!(
-        "node:       {} rounds (one lucky draw each) and {} commits in the window: a round every {:.1}s, a commit every {:.1}s (from its neighbor packets)",
-        s.node_rounds, s.node_commits, s.round_interval_s, s.commit_interval_s
-    );
-    println!(
-        "delivered:  {} commits reached our peers in the window = {:.2} per round (at most {} — the lucky set — and fewer once most peers already hold the best commit); {} of {} peers ever got one",
-        s.commits_delivered,
-        if s.node_rounds > 0 {
-            s.commits_delivered as f64 / s.node_rounds as f64
-        } else {
-            0.0
-        },
-        LUCKY_PEERS,
-        s.peers_with_commit,
-        s.peers_open_at_end,
-    );
-    let predicted = s.peers_open_at_end as f64 / LUCKY_PEERS as f64 * s.round_interval_s;
-    println!(
-        "gap s:      between commits reaching the same peer: p50={:.0} p90={:.0} p99={:.0} max={:.0} mean={:.0} | predicted mean N/4*T_round = {:.0} for our {} peers alone (scale by total light peers / {})",
-        s.gap_s.p50,
-        s.gap_s.p90,
-        s.gap_s.p99,
-        s.gap_s.max,
-        s.gap_s.mean,
-        predicted,
-        s.peers_open_at_end,
-        s.peers_open_at_end,
+        "lag        p50 {:>4.0} s | p90 {:>4.0} s | max {:>4.0} s   ({:.0} / {:.0} / {:.0} blocks)   how far a peer's finalized head trails the node",
+        s.lag_s.p50, s.lag_s.p90, s.lag_s.max, s.lag_blocks.p50, s.lag_blocks.p90, s.lag_blocks.max,
     );
     println!(
-        "lag s:      how far behind the node a peer's finalized head is, sampled every second: p50={:.0} p90={:.0} p99={:.0} max={:.0} mean={:.0}",
-        s.lag_s.p50, s.lag_s.p90, s.lag_s.p99, s.lag_s.max, s.lag_s.mean
+        "gap        p50 {:>4.0} s | p90 {:>4.0} s | max {:>4.0} s   between two commits reaching the same peer",
+        s.gap_s.p50, s.gap_s.p90, s.gap_s.max,
     );
     println!(
-        "lag blocks: p50={:.0} p90={:.0} p99={:.0} max={:.0} mean={:.1}",
-        s.lag_blocks.p50, s.lag_blocks.p90, s.lag_blocks.p99, s.lag_blocks.max, s.lag_blocks.mean
+        "node       round every {:.1} s | commit every {:.1} s | {} rounds, {} commits in the window",
+        s.round_interval_s, s.commit_interval_s, s.node_rounds, s.node_commits,
     );
     println!(
-        "starved:    {} of {} peer-samples were more than {:.1} min behind — the periodic rebroadcast does not reach a peer that lacks the commit",
-        s.samples_over_cap,
-        s.samples,
-        REBROADCAST_AFTER.as_secs_f64() / 60.0 + 0.5
+        "delivered  each commit reached {per_commit:.1} of {open} peers | {per_round:.1} deliveries per round | {} duplicates ({dup_pct:.0}%)",
+        s.duplicates,
     );
     println!(
-        "commit:     {:.0} bytes p50, {:.0} min, {:.0} max on the wire; at one commit per {:.1}s that is {:.2} kB/s per light peer",
-        s.commit_bytes.p50,
-        s.commit_bytes.min,
-        s.commit_bytes.max,
-        s.commit_interval_s,
-        if s.commit_interval_s > 0.0 {
-            s.commit_bytes.mean / s.commit_interval_s / 1000.0
-        } else {
-            0.0
-        },
+        "commit     {:.0} kB on the wire ({:.0} min, {:.0} max) | {kb_per_s:.1} kB/s per light peer | {:.0} kB/s for these {open}",
+        s.commit_bytes.p50 / 1000.0,
+        s.commit_bytes.min / 1000.0,
+        s.commit_bytes.max / 1000.0,
+        kb_per_s * open as f64,
     );
-    println!(
-        "traffic:    {} votes and {} undecodable/other messages on the grandpa substreams",
-        metrics.votes.load(Ordering::Relaxed),
-        metrics.other.load(Ordering::Relaxed),
-    );
+
+    // Only speak up when something needs attention.
+    let mut notes = Vec::new();
+    if held_at_end < peers as u64 || open < peers {
+        notes.push(format!(
+            "{held_at_end}/{peers} held block-announces, {open}/{peers} grandpa at window end"
+        ));
+    }
+    if metrics.refused.load(Ordering::Relaxed) > 0 {
+        notes.push(format!(
+            "{} block-announces refused (node at its light-peer limit?)",
+            metrics.refused.load(Ordering::Relaxed)
+        ));
+    }
+    if s.peers_with_commit < open {
+        notes.push(format!(
+            "{} of {open} peers never received a commit",
+            open - s.peers_with_commit
+        ));
+    }
+    if s.samples_over_cap > 0 {
+        notes.push(format!(
+            "{} of {} peer-samples more than {:.1} min behind",
+            s.samples_over_cap,
+            s.samples,
+            REBROADCAST_AFTER.as_secs_f64() / 60.0 + 0.5
+        ));
+    }
+    let votes = metrics.votes.load(Ordering::Relaxed);
+    let other = metrics.other.load(Ordering::Relaxed);
+    if votes > 0 || other > 0 {
+        notes.push(format!(
+            "{votes} votes and {other} undecodable messages on the grandpa substreams"
+        ));
+    }
+    if notes.is_empty() {
+        println!("health     ok: every peer held both substreams and received commits");
+    } else {
+        for note in notes {
+            println!("health     {note}");
+        }
+    }
 }
 
 /// Entry point for the `finality-lag` command.

@@ -88,26 +88,29 @@ outsiders, deliveries per round ≈ 4).
 ## Reading the output
 
 ```
-=== finality-lag summary ===
-peers:      8 offered as Light; 8 held block-announces and 8 grandpa at the end; refused 0 / 8 (...)
-node:       41 rounds (one lucky draw each) and 24 commits in the window: a round every 4.4s, a commit every 7.3s
-delivered:  118 commits reached our peers in the window = 2.88 per round (at most 4 ...); 8 of 8 peers ever got one
-gap s:      between commits reaching the same peer: p50=9 p90=24 p99=29 max=37 mean=12 | predicted N/4*T_round = 9 for our 8 peers alone
-lag s:      how far behind the node a peer's finalized head is, sampled every second: p50=8 p90=20 p99=32 max=45 mean=10
-lag blocks: p50=0 p90=2 p99=4 max=5 mean=0.8
-cap:        0 of 180 peer-samples were more than 5.5 min behind
+=== finality-lag: 8 Light peers, 300 s ===
+lag        p50   15 s | p90   25 s | max   38 s   (1 / 4 / 6 blocks)   how far a peer's finalized head trails the node
+gap        p50   20 s | p90   22 s | max   23 s   between two commits reaching the same peer
+node       round every 4.1 s | commit every 9.6 s | 73 rounds, 31 commits in the window
+delivered  each commit reached 4.1 of 8 peers | 1.8 deliveries per round | 9 duplicates (7%)
+commit     53 kB on the wire (53 min, 54 max) | 5.5 kB/s per light peer | 44 kB/s for these 8
+health     ok: every peer held both substreams and received commits
 ```
 
-- **gap s** is the headline: time between two commits reaching the same peer.
-  Compare with `predicted`; with load, scale the prediction by
-  `(probe + load) / probe`.
-- **lag s** is what a smoldot user experiences: at any second, how stale each
-  peer's finalized head is relative to the node's. Its mean ≈ gap for
-  random-draw gaps.
-- **starved** counts peer-samples beyond 5.5 min behind. It is not zero, which
-  is the measurement that the 5-min periodic rebroadcast does not act as a cap.
-- **grandpa refused** is our own early open attempt, before the node had granted
-  the block-announces slot; the node then opens the substream to us.
+- **lag** is what a smoldot user experiences: at any second, how stale each
+  peer's finalized head is relative to the node's, in seconds and in blocks.
+- **gap** is what the node's gossip policy does: time between two commits
+  reaching the same peer. With random or rotating selection the two are close.
+- **delivered** shows the policy directly: "reached 8.0 of 8 peers" means every
+  peer gets every commit; "4.1 of 8" is the 4-lucky-peers node; with rotating
+  groups it is N / groups. Duplicates are extra copies of one round's commit
+  (several validators' commits imported before the node's view moved), a
+  pre-existing 5-13% overhead.
+- **commit** is the cost side: node egress to light peers is peers × kB/s.
+- For the stock node, compare gap with the lucky-set prediction
+  `light peers / 4 × round interval` (the `pred` column of `finality-lag-table`).
+- **health** lists anything off (refusals, peers without commits, peers more
+  than 5.5 min behind, unexpected message types), or says ok.
 
 Files with `--out-dir`: `commits.csv` (every commit delivered: peer, round,
 target, delay after the node finalized it), `lag-samples.csv` (per-second
