@@ -225,7 +225,7 @@ impl CsvSampler {
         let mut file = fs::File::create(path)?;
         writeln!(
             file,
-            "epoch_ms,phase,elapsed_s,offered,connected,held,peak_held,refused,evicted,announces"
+            "epoch_ms,phase,elapsed_s,offered,connected,held,peak_held,refused,evicted,announces,grandpa,commits"
         )?;
         Ok(Self { file })
     }
@@ -243,13 +243,15 @@ impl CsvSampler {
             .as_millis();
         let _ = writeln!(
             self.file,
-            "{epoch_ms},{phase},{elapsed:.1},{offered},{},{},{},{},{},{}",
+            "{epoch_ms},{phase},{elapsed:.1},{offered},{},{},{},{},{},{},{},{}",
             metrics.connected.load(Ordering::Relaxed),
             metrics.held.load(Ordering::Relaxed),
             metrics.peak_held.load(Ordering::Relaxed),
             metrics.refused.load(Ordering::Relaxed),
             metrics.evicted.load(Ordering::Relaxed),
             metrics.announces.load(Ordering::Relaxed),
+            metrics.grandpa_open.load(Ordering::Relaxed),
+            metrics.commits.load(Ordering::Relaxed),
         );
     }
 }
@@ -499,6 +501,7 @@ fn print_report(
     ramp_ms: u64,
     held_at_start: u64,
     steady_held: u64,
+    grandpa_at_end: u64,
     connect_secs: f64,
     hold_secs: f64,
 ) {
@@ -528,8 +531,7 @@ fn print_report(
         metrics.dial_failed.load(Ordering::Relaxed),
     );
     println!(
-        "grandpa:    {} substreams open at the end; {} commits and {} neighbor packets received in total",
-        metrics.grandpa_open.load(Ordering::Relaxed),
+        "grandpa:    {grandpa_at_end} substreams open at window end; {} commits and {} neighbor packets received in total",
         metrics.commits.load(Ordering::Relaxed),
         metrics.neighbors.load(Ordering::Relaxed),
     );
@@ -832,6 +834,7 @@ pub async fn hold_peers(
     // Read the count before telling the holders to stop, so none of them can
     // release its slot first.
     let steady_held = metrics.held.load(Ordering::Relaxed);
+    let grandpa_at_end = metrics.grandpa_open.load(Ordering::Relaxed);
     if let Some(sampler) = sampler.as_mut() {
         sampler.sample(&metrics, "hold", hold_secs, opened);
     }
@@ -860,6 +863,7 @@ pub async fn hold_peers(
         ramp_ms,
         held_at_start,
         steady_held,
+        grandpa_at_end,
         connect_secs,
         hold_secs,
     );

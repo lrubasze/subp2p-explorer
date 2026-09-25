@@ -107,6 +107,8 @@ enum GossipEvent {
         round: u64,
         set_id: u64,
         target: u32,
+        /// Wire size of the commit message — what the fix costs per light peer.
+        bytes: usize,
     },
     /// The orchestrator marks the start of the hold window.
     HoldStart {
@@ -180,6 +182,8 @@ pub(crate) struct Summary {
     /// rebroadcast does not rescue a starved peer.
     samples_over_cap: u64,
     samples: u64,
+    /// Wire size of a commit message, over every delivery.
+    commit_bytes: Percentiles,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -188,6 +192,7 @@ struct Percentiles {
     p90: f64,
     p99: f64,
     max: f64,
+    min: f64,
     mean: f64,
 }
 
@@ -202,6 +207,7 @@ fn percentiles(values: &mut [f64]) -> Percentiles {
         p90: at(90),
         p99: at(99),
         max: values[values.len() - 1],
+        min: values[0],
         mean: values.iter().sum::<f64>() / values.len() as f64,
     }
 }
@@ -223,6 +229,8 @@ struct Collector {
     anchor: WallAnchor,
     commits_csv: Option<fs::File>,
     samples_csv: Option<fs::File>,
+    /// Wire size of every commit delivered.
+    commit_bytes: Vec<f64>,
     /// Per-sample lag values over the hold window, pooled across peers.
     lag_s: Vec<f64>,
     lag_blocks: Vec<f64>,
@@ -282,8 +290,10 @@ impl Collector {
                 round,
                 set_id,
                 target,
+                bytes,
             } => {
                 self.note_node_height(target, at);
+                self.commit_bytes.push(bytes as f64);
                 let node_at = self.node_finalized_at(target).unwrap_or(at);
                 let in_hold = self.hold_start.is_some_and(|start| at >= start);
                 let state = &mut self.peers[peer];
@@ -303,7 +313,7 @@ impl Collector {
                 if let Some(file) = self.commits_csv.as_mut() {
                     let _ = writeln!(
                         file,
-                        "{},{peer},{set_id},{round},{target},{},{:.0},{}",
+                        "{},{peer},{set_id},{round},{target},{},{:.0},{},{bytes}",
                         self.anchor.epoch_ms(at),
                         self.node_head,
                         at.duration_since(node_at).as_secs_f64() * 1000.0,
@@ -435,6 +445,7 @@ impl Collector {
             lag_blocks: percentiles(&mut self.lag_blocks),
             samples_over_cap: self.samples_over_cap,
             samples: self.samples,
+            commit_bytes: percentiles(&mut self.commit_bytes),
         }
     }
 }
@@ -542,7 +553,9 @@ async fn run_peer(
                         }
                         GrandpaMessage::Commit { round, set_id, target } => {
                             metrics.commits.fetch_add(1, Ordering::Relaxed);
-                            let _ = events.send(GossipEvent::Commit { peer: id, at, round, set_id, target });
+                            let _ = events.send(GossipEvent::Commit {
+                                peer: id, at, round, set_id, target, bytes: message.len(),
+                            });
                         }
                         GrandpaMessage::Vote => {
                             metrics.votes.fetch_add(1, Ordering::Relaxed);
@@ -621,6 +634,8 @@ fn write_summary(
         )?;
     }
     writeln!(file, "samples={}", s.samples)?;
+    writeln!(file, "commit_bytes_p50={:.0}", s.commit_bytes.p50)?;
+    writeln!(file, "commit_bytes_max={:.0}", s.commit_bytes.max)?;
     writeln!(file, "samples_over_cap={}", s.samples_over_cap)?;
     Ok(())
 }
@@ -682,6 +697,18 @@ fn print_report(
         s.samples_over_cap,
         s.samples,
         REBROADCAST_AFTER.as_secs_f64() / 60.0 + 0.5
+    );
+    println!(
+        "commit:     {:.0} bytes p50, {:.0} min, {:.0} max on the wire; at one commit per {:.1}s that is {:.2} kB/s per light peer",
+        s.commit_bytes.p50,
+        s.commit_bytes.min,
+        s.commit_bytes.max,
+        s.commit_interval_s,
+        if s.commit_interval_s > 0.0 {
+            s.commit_bytes.mean / s.commit_interval_s / 1000.0
+        } else {
+            0.0
+        },
     );
     println!(
         "traffic:    {} votes and {} undecodable/other messages on the grandpa substreams",
@@ -768,12 +795,13 @@ pub async fn finality_lag(
         anchor,
         commits_csv: open_csv(
             "commits.csv",
-            "epoch_ms,peer,set_id,round,target,node_head,delay_ms,in_hold_window",
+            "epoch_ms,peer,set_id,round,target,node_head,delay_ms,in_hold_window,bytes",
         )?,
         samples_csv: open_csv(
             "lag-samples.csv",
             "epoch_ms,phase,elapsed_s,node_head,peers_open,lag_s_p50,lag_s_p90,lag_s_max,lag_blocks_p50,lag_blocks_p90,lag_blocks_max,fresh_pct",
         )?,
+        commit_bytes: Vec::new(),
         lag_s: Vec::new(),
         lag_blocks: Vec::new(),
         samples_over_cap: 0,
